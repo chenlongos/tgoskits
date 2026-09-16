@@ -20,6 +20,11 @@ struct PinmuxOp {
 
 pub struct PinmuxDev;
 
+/// Mask for the FSEL (Function Select) bit field in each FMUX register.
+/// The low 4 bits select the pad function; upper bits control pull-up/down,
+/// drive strength, and slew rate which must be preserved across writes.
+const FSEL_MASK: u32 = 0xF;
+
 impl PinmuxDev {
     fn parse_u32(text: &str) -> VfsResult<u32> {
         let text = text.trim();
@@ -30,13 +35,20 @@ impl PinmuxDev {
         }
     }
 
+    /// Read-modify-write an FMUX register: only updates the low FSEL bit field
+    /// while preserving all upper bits (PUD, drive strength, slew rate, etc.).
+    /// A blind `write_volatile` would zero those bits, corrupting the pad's
+    /// electrical characteristics and potentially causing bus glitches.
     fn write_fmux(offset: usize, value: u32) -> VfsResult<()> {
         if offset >= FMUX_SIZE || !offset.is_multiple_of(4) {
             return Err(VfsError::InvalidInput);
         }
         let vaddr = phys_to_virt(PhysAddr::from_usize(FMUX_PBASE + offset)).as_usize();
         unsafe {
-            core::ptr::write_volatile(vaddr as *mut u32, value);
+            let ptr = vaddr as *mut u32;
+            let current = core::ptr::read_volatile(ptr);
+            let new_value = (current & !FSEL_MASK) | (value & FSEL_MASK);
+            core::ptr::write_volatile(ptr, new_value);
         }
         Ok(())
     }
