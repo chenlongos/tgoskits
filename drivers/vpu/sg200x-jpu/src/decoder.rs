@@ -332,6 +332,12 @@ impl JpuDecoder {
         )?)
     }
 
+    /// Returns `true` if the decoder was poisoned by a previous hardware error
+    /// or timeout and must be reinitialized before further use.
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned
+    }
+
     fn validate_decoder_ready(&self) -> Result<(), JpuDecodeError> {
         if self.poisoned {
             return Err(JpuDecodeError::Poisoned);
@@ -471,9 +477,9 @@ impl JpuDecoder {
 
 impl Drop for JpuDecoder {
     fn drop(&mut self) {
-        if !self.poisoned {
-            JPU_IN_USE.store(false, Ordering::Release);
-        }
+        // Always release the JPU ownership flag so callers can drop a poisoned
+        // decoder and create a fresh one after reinitializing the hardware.
+        JPU_IN_USE.store(false, Ordering::Release);
     }
 }
 

@@ -28,6 +28,14 @@ struct JpuState {
 
 impl JpuState {
     fn decoder(&mut self) -> StarryResult<&mut JpuDecoder> {
+        // Drop a poisoned decoder and recreate one so hardware timeouts or
+        // DMA errors do not permanently lock out every subsequent capture.
+        if let Some(decoder) = self.decoder.as_ref()
+            && decoder.is_poisoned()
+        {
+            warn!("cvi-jpu: decoder poisoned, reinitializing hardware");
+            self.decoder = None;
+        }
         if self.decoder.is_none() {
             self.decoder = Some(create_decoder()?);
         }
@@ -74,9 +82,11 @@ impl CviJpu {
         if state.vdec_owned {
             return Err(crate::StarryError::ResourceBusy);
         }
+        // Always decode to YUV420 planar so the userspace contract is stable
+        // regardless of the JPEG's native sampling format (YUV420, YUV422, etc.).
         let result = state
             .decoder()?
-            .decode(jpeg)
+            .decode_scaled_yuv420(jpeg, JpuScale::Full)
             .map_err(|error| map_decode_error(&error))?;
         vm_write_slice(current, destination, result.yuv_data)?;
         Ok(result.yuv_data.len())
