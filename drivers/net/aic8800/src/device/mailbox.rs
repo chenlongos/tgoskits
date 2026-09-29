@@ -247,8 +247,8 @@ impl AicDevice {
     fn complete_control_mailbox(&mut self, result: Vec<u8>) -> Result<(), AicError> {
         use super::control::{ConnectPhase, ControlOperation};
         use crate::lmac::{
-            APM_START_CFM, ME_SET_CONTROL_PORT_CFM, MM_ADD_IF_CFM, MM_KEY_ADD_CFM, SM_CONNECT_CFM,
-            SM_DISCONNECT_CFM,
+            APM_START_CFM, ME_SET_CONTROL_PORT_CFM, ME_STA_ADD_CFM, MM_ADD_IF_CFM, MM_KEY_ADD_CFM,
+            MM_RESET_CFM, SM_CONNECT_CFM, SM_DISCONNECT_CFM,
         };
 
         let control = self
@@ -263,6 +263,7 @@ impl AicDevice {
             .ok_or(AicError::CompletionMismatch)?;
         let mut finish = false;
         let mut open_control_port = false;
+        let mut ap_station_add_done = false;
         let mut m4 = None;
         match expected {
             SM_DISCONNECT_CFM
@@ -315,15 +316,92 @@ impl AicDevice {
                 self.data.link.clear_peer();
                 finish = true;
             }
+            MM_RESET_CFM => {
+                crate::lmac::require_empty(MM_RESET_CFM, &result)?;
+                control.pop_command();
+                // The MAC reset clears all firmware VIFs and SM associations.
+                // Mirror that in the host link state so no stale peer or
+                // internal frames survive the STA→AP transition, and clear
+                // the interface index so the next Connect re-registers the
+                // STA VIF before issuing SM_CONNECT_REQ.
+                self.data.link.clear_interface();
+                self.data.clear_internal_tx();
+                self.data.ap = None;
+            }
             MM_ADD_IF_CFM => {
                 let index = crate::lmac::parse_add_interface(&result)?;
-                control.assign_ap_interface(index)?;
+                if matches!(&control.operation, ControlOperation::Connect(_)) {
+                    // A prior MAC reset cleared the STA VIF; the Connect flow
+                    // prepended MM_ADD_IF_REQ to re-register it. Patch the
+                    // firmware-assigned index into the pending SM_CONNECT_REQ.
+                    if let Some(command) = control
+                        .commands
+                        .iter_mut()
+                        .find(|c| c.message_id == crate::lmac::SM_CONNECT_REQ)
+                    {
+                        command.payload[crate::lmac::SM_CONNECT_VIF_OFFSET] = index;
+                    }
+                    control.pop_command();
+                } else {
+                    // AP flow: MM_START_REQ is a global firmware start (phy
+                    // config, uapsd timeout, clock accuracy) and carries no
+                    // per-VIF index, so it must not be patched here. Only the
+                    // APM messages own a `vif_idx` field; pin the firmware-
+                    // assigned index into them.
+                    control.assign_ap_interface(index)?;
+                    // Record the running AP so the data plane can answer client
+                    // authentication and association requests on this VIF.
+                    self.data.ap = Some(super::owner::ApState::new(index));
+                }
             }
             APM_START_CFM => {
-                control.confirm_ap_start(&result)?;
+                let bcmc_index = control.confirm_ap_start(&result)?;
+                if let Some(ap) = self.data.ap.as_mut() {
+                    ap.set_bcmc(bcmc_index);
+                }
                 finish = control.commands.is_empty();
+                if finish {
+                    // The AP VIF index is not valid for STA operations.
+                    // Clear it so the next Connect re-registers the STA VIF
+                    // via MM_ADD_IF_REQ before issuing SM_CONNECT_REQ.
+                    self.data.link.clear_interface();
+                }
+                log::info!(
+                    "[wifi] AP start confirmed (vif={}, bcmc={}, commands_remaining={}, finish={})",
+                    self.data.link.interface_index().unwrap_or(0xff),
+                    bcmc_index,
+                    control.commands.len(),
+                    finish
+                );
+            }
+            ME_STA_ADD_CFM => {
+                let station_index = crate::lmac::parse_me_sta_add_confirmation(&result)?;
+                let peer = self
+                    .data
+                    .ap
+                    .as_mut()
+                    .and_then(|ap| ap.complete_station_add(station_index));
+                control.pop_command();
+                log::info!(
+                    "[wifi] AP station added: peer={peer:02x?} firmware_index={} \
+                     pending_commands={}",
+                    station_index,
+                    control.commands.len(),
+                );
+                // The station-add queue belongs to the running access point,
+                // not a waiting caller: once drained it is dropped without a
+                // `ControlComplete` so the interface stops reporting `Busy`.
+                ap_station_add_done = control.commands.is_empty();
             }
             _ => {
+                let remaining = control.commands.len().saturating_sub(1);
+                let is_last = control.commands.len() <= 1;
+                log::debug!(
+                    "[wifi] control confirmation id={:#06x}, remaining={}, finish={}",
+                    expected,
+                    remaining,
+                    is_last
+                );
                 control.pop_command();
                 finish = control.commands.is_empty();
             }
@@ -333,6 +411,10 @@ impl AicDevice {
         }
         if let Some(frame) = m4 {
             self.queue_internal_eapol(super::owner::InternalTxKind::M4, frame)?;
+        }
+        if ap_station_add_done {
+            self.lifecycle.control = None;
+            return Ok(());
         }
         if finish {
             self.lifecycle.control = None;
@@ -699,17 +781,23 @@ mod tests {
     fn ap_add_if_confirmation_assigns_the_vif_index_to_beacon_and_apm_start() {
         let mut device = AicDevice::new(ChipVariant::Aic8800D80).unwrap();
         device.lifecycle.state = AicState::Ready;
-        device.lifecycle.control = Some(
-            super::control::build(
-                ControlRequest::StartOpenAccessPoint {
-                    ssid: b"SG2002".to_vec(),
-                    channel: 6,
-                },
-                [2, 0, 0, 0, 0, 1],
-                Some(0),
-            )
-            .unwrap(),
-        );
+        let mut control = super::control::build(
+            ControlRequest::StartOpenAccessPoint {
+                ssid: b"SG2002".to_vec(),
+                channel: 6,
+            },
+            [2, 0, 0, 0, 0, 1],
+            Some(0),
+        )
+        .unwrap();
+        // Advance past the pre-interface confirmations (`MM_RESET`,
+        // `ME_CONFIG`, `MECHAN`) so `MM_ADD_IF_REQ` sits at the front of the
+        // queue, as it does on a real run once those CFMs are processed.
+        while control.commands.front().map(|c| c.message_id) != Some(crate::lmac::MM_ADD_IF_REQ) {
+            control.commands.pop_front();
+        }
+        device.lifecycle.control = Some(control);
+        device.data.link.clear_interface();
         device.lifecycle.mailbox = Some(MailboxState {
             frame: Vec::new(),
             request: MailboxRequest::Lmac {
@@ -745,17 +833,23 @@ mod tests {
             let payload_length = payload.len();
             let mut device = AicDevice::new(ChipVariant::Aic8800D80).unwrap();
             device.lifecycle.state = AicState::Ready;
-            device.lifecycle.control = Some(
-                super::control::build(
-                    ControlRequest::StartOpenAccessPoint {
-                        ssid: b"test".to_vec(),
-                        channel: 6,
-                    },
-                    [2, 0, 0, 0, 0, 1],
-                    Some(0),
-                )
-                .unwrap(),
-            );
+            let mut control = super::control::build(
+                ControlRequest::StartOpenAccessPoint {
+                    ssid: b"test".to_vec(),
+                    channel: 6,
+                },
+                [2, 0, 0, 0, 0, 1],
+                Some(0),
+            )
+            .unwrap();
+            // Advance past the pre-interface confirmations (`MM_RESET`,
+            // `ME_CONFIG`, `MECHAN`) so `MM_ADD_IF_REQ` is at the front.
+            while control.commands.front().map(|c| c.message_id) != Some(crate::lmac::MM_ADD_IF_REQ)
+            {
+                control.commands.pop_front();
+            }
+            device.lifecycle.control = Some(control);
+            device.data.link.clear_interface();
             device.lifecycle.mailbox = Some(MailboxState {
                 frame: Vec::new(),
                 request: MailboxRequest::Lmac {
@@ -786,17 +880,22 @@ mod tests {
     fn ap_add_if_rejection_surfaces_the_firmware_status() {
         let mut device = AicDevice::new(ChipVariant::Aic8800D80).unwrap();
         device.lifecycle.state = AicState::Ready;
-        device.lifecycle.control = Some(
-            super::control::build(
-                ControlRequest::StartOpenAccessPoint {
-                    ssid: b"SG2002".to_vec(),
-                    channel: 6,
-                },
-                [2, 0, 0, 0, 0, 1],
-                Some(0),
-            )
-            .unwrap(),
-        );
+        let mut control = super::control::build(
+            ControlRequest::StartOpenAccessPoint {
+                ssid: b"SG2002".to_vec(),
+                channel: 6,
+            },
+            [2, 0, 0, 0, 0, 1],
+            Some(0),
+        )
+        .unwrap();
+        // Advance past the pre-interface confirmations (`MM_RESET`,
+        // `ME_CONFIG`, `MECHAN`) so `MM_ADD_IF_REQ` is at the front.
+        while control.commands.front().map(|c| c.message_id) != Some(crate::lmac::MM_ADD_IF_REQ) {
+            control.commands.pop_front();
+        }
+        device.lifecycle.control = Some(control);
+        device.data.link.clear_interface();
         device.lifecycle.mailbox = Some(MailboxState {
             frame: Vec::new(),
             request: MailboxRequest::Lmac {
@@ -861,6 +960,84 @@ mod tests {
                 status: 5
             })
         ));
+    }
+
+    #[test]
+    fn apm_start_confirmation_records_the_broadcast_station_index() {
+        let mut device = AicDevice::new(ChipVariant::Aic8800D80).unwrap();
+        device.lifecycle.state = AicState::Ready;
+        let mut control = super::control::build(
+            ControlRequest::StartOpenAccessPoint {
+                ssid: b"SG2002".to_vec(),
+                channel: 6,
+            },
+            [2, 0, 0, 0, 0, 1],
+            Some(0),
+        )
+        .unwrap();
+        while control.commands.front().map(|command| command.message_id)
+            != Some(crate::lmac::APM_START_REQ)
+        {
+            control.commands.pop_front();
+        }
+        // The freshly built `APM_START_REQ` still carries its placeholder VIF
+        // index (byte 51).  The confirmation echoes that index and returns the
+        // firmware BC/MC station (byte 3) the access point must send broadcast
+        // frames on; the data plane needs it recorded to route a client's DHCP
+        // reply to a station that actually exists.
+        let vif = control.commands.front().unwrap().payload[51];
+        device.lifecycle.control = Some(control);
+        device.data.ap = Some(super::owner::ApState::new(vif));
+        device.lifecycle.mailbox = Some(MailboxState {
+            frame: Vec::new(),
+            request: MailboxRequest::Lmac {
+                message_id: crate::lmac::APM_START_REQ,
+            },
+            expected_message_id: crate::lmac::APM_START_CFM,
+            phase: MailboxPhase::Complete,
+            deadline: MonotonicTime::from_nanos(1),
+            retry_at: None,
+            flow_retries: 0,
+            result: Some(vec![0, vif, 0, 9]),
+        });
+
+        assert_eq!(device.complete_mailbox(), Ok(()));
+        assert_eq!(device.data.ap.as_ref().unwrap().bcmc_index, 9);
+    }
+
+    #[test]
+    fn ap_station_add_confirmation_drops_control_without_completing() {
+        use super::control::ControlState;
+        use crate::{device::owner::ApState, lmac::ME_STA_ADD_REQ};
+
+        let peer = [0x7c, 0x50, 0x79, 0x36, 0xf0, 0x15];
+        let mut device = AicDevice::new(ChipVariant::Aic8800D80).unwrap();
+        device.lifecycle.state = AicState::Ready;
+        let command = super::control::ap_sta_add_command(peer, &[0x82, 0x84], 1, 3);
+        let expected_message_id = command.expected_message_id;
+        device.lifecycle.control = Some(ControlState::ap_station_add(command));
+        let mut ap = ApState::new(3);
+        ap.queue_station_add(peer);
+        device.data.ap = Some(ap);
+        device.lifecycle.mailbox = Some(MailboxState {
+            frame: Vec::new(),
+            request: MailboxRequest::Lmac {
+                message_id: ME_STA_ADD_REQ,
+            },
+            expected_message_id,
+            phase: MailboxPhase::Complete,
+            deadline: MonotonicTime::from_nanos(1),
+            retry_at: None,
+            flow_retries: 0,
+            result: Some(vec![5, 0, 0]),
+        });
+
+        assert_eq!(device.complete_mailbox(), Ok(()));
+        // The station-add queue has no waiting caller, so its confirmation is
+        // consumed silently: the transient control state is dropped and no
+        // `ControlComplete` event reaches the interface.
+        assert!(device.lifecycle.control.is_none());
+        assert!(device.data.events.is_empty());
     }
 
     #[test]

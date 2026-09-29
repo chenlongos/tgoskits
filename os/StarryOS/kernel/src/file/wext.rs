@@ -59,8 +59,8 @@ const WPA2_PMK_SIZE: usize = 32;
 /// Mirrors the boot-time SoftAP policy the board attaches in
 /// `ax-driver`'s aic8800 probe; kept here so a runtime switch to AP lands on
 /// the same subnet as the boot default.
-const AP_SERVER_IP: [u8; 4] = [192, 168, 50, 1];
-const AP_CLIENT_IP: [u8; 4] = [192, 168, 50, 2];
+const AP_SERVER_IP: [u8; 4] = [192, 168, 4, 1];
+const AP_CLIENT_IP: [u8; 4] = [192, 168, 4, 2];
 const AP_PREFIX_LEN: u8 = 24;
 const AP_CHANNEL_DEFAULT: u8 = 6;
 
@@ -298,6 +298,11 @@ fn commit(ifname: &str) -> StarryResult<usize> {
         StagedMode::AccessPoint => {
             let ssid = pending.ssid.ok_or(StarryError::InvalidInput)?;
             let channel = pending.channel.unwrap_or(AP_CHANNEL_DEFAULT);
+            info!(
+                "[wifi] {ifname}: applying staged AP configuration ssid=\"{}\" channel={}",
+                core::str::from_utf8(&ssid).unwrap_or("<invalid>"),
+                channel
+            );
             ax_net::reconfigure_wifi(
                 ifname,
                 ax_net::WifiTransaction::open_access_point(

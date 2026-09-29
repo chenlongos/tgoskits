@@ -63,6 +63,8 @@ pub(crate) const ME_CHAN_CONFIG_REQ: u16 = 0x1402;
 pub(crate) const ME_CHAN_CONFIG_CFM: u16 = 0x1403;
 pub(crate) const ME_SET_CONTROL_PORT_REQ: u16 = 0x1404;
 pub(crate) const ME_SET_CONTROL_PORT_CFM: u16 = 0x1405;
+pub(crate) const ME_STA_ADD_REQ: u16 = 0x1407;
+pub(crate) const ME_STA_ADD_CFM: u16 = 0x1408;
 // The Linux driver may issue this request after a TX queue transition.  The
 // firmware can return its confirmation asynchronously even when this Rust
 // owner did not submit the optional traffic indication request, so it must not
@@ -94,7 +96,7 @@ const SM_CONNECT_CHANNEL_OFFSET: usize = 40;
 const SM_CONNECT_FLAGS_OFFSET: usize = 48;
 const SM_CONNECT_CONTROL_PORT_OFFSET: usize = 52;
 const SM_CONNECT_IE_LEN_OFFSET: usize = 54;
-const SM_CONNECT_VIF_OFFSET: usize = 61;
+pub(crate) const SM_CONNECT_VIF_OFFSET: usize = 61;
 const SM_CONNECT_IE_OFFSET: usize = 64;
 
 pub(crate) struct ConnectIndication {
@@ -170,7 +172,12 @@ pub(crate) fn parse_add_interface(payload: &[u8]) -> Result<u8, AicError> {
         .ok_or(AicError::MalformedResponse)
 }
 
-pub(crate) fn parse_ap_start(payload: &[u8], interface_index: u8) -> Result<(), AicError> {
+/// Validates an `APM_START_CFM` and returns the firmware station index to use
+/// for broadcast/multicast traffic on the started AP (`bcmc_idx`, the fourth
+/// byte of the vendor `struct apm_start_cfm`).  The firmware rejects an
+/// unusable channel or BC/MC index, so the returned value is always a real
+/// station the access point must transmit broadcast frames through.
+pub(crate) fn parse_ap_start(payload: &[u8], interface_index: u8) -> Result<u8, AicError> {
     if payload.len() != 4 {
         return Err(AicError::MalformedResponse);
     }
@@ -178,7 +185,7 @@ pub(crate) fn parse_ap_start(payload: &[u8], interface_index: u8) -> Result<(), 
     if payload[1] != interface_index || payload[2] == u8::MAX || payload[3] == u8::MAX {
         return Err(AicError::MalformedResponse);
     }
-    Ok(())
+    Ok(payload[3])
 }
 
 pub(crate) fn parse_connect_indication(payload: &[u8]) -> Result<ConnectIndication, AicError> {
@@ -352,6 +359,65 @@ pub(crate) const fn control_port_payload(station_index: u8, open: bool) -> [u8; 
     [station_index, open as u8]
 }
 
+// `struct me_sta_add_req` follows the vendor driver's natural C alignment on
+// a little-endian, non-TL4 target (so `u8_l` and `bool_l` are one byte each).
+// The HT/VHT/HE capability structures sit inline between the rate set and the
+// scalar tail; their fixed sizes (HT 32, VHT 12, HE 56) are the same ones the
+// already-verified `me_config_req` uses, whose `uapsd_timeout` lands at offset
+// 100 = 32 + 12 + 56. Keep every offset here so the builder cannot drift.
+const ME_STA_ADD_LEN: usize = 136;
+const ME_STA_ADD_RATESET_LEN_OFFSET: usize = 6;
+const ME_STA_ADD_RATESET_OFFSET: usize = 7;
+const ME_STA_ADD_RATESET_MAX: usize = 12;
+const ME_STA_ADD_AID_OFFSET: usize = 124;
+const ME_STA_ADD_VIF_OFFSET: usize = 129;
+
+/// Builds the `ME_STA_ADD_REQ` payload that registers an associated client
+/// with the firmware (the access-point data path has no station context until
+/// this confirmation returns a station index).  Only the MAC address, the
+/// legacy supported-rate set taken from the client's association request, the
+/// allocated AID and the AP VIF index are populated; the HT/VHT/HE capability
+/// structures and the `flags` word stay zero, describing a legacy station.
+pub(crate) fn me_sta_add_payload(
+    mac: [u8; 6],
+    rates: &[u8],
+    aid: u16,
+    interface_index: u8,
+) -> Vec<u8> {
+    let mut payload = vec![0; ME_STA_ADD_LEN];
+    payload[0..6].copy_from_slice(&mac);
+    let count = rates.len().min(ME_STA_ADD_RATESET_MAX);
+    payload[ME_STA_ADD_RATESET_LEN_OFFSET] = count as u8;
+    payload[ME_STA_ADD_RATESET_OFFSET..ME_STA_ADD_RATESET_OFFSET + count]
+        .copy_from_slice(&rates[..count]);
+    payload[ME_STA_ADD_AID_OFFSET..ME_STA_ADD_AID_OFFSET + 2].copy_from_slice(&aid.to_le_bytes());
+    payload[ME_STA_ADD_VIF_OFFSET] = interface_index;
+    payload
+}
+
+/// Parses `struct me_sta_add_cfm { u8 sta_idx; u8 status; u8 pm_state; u8
+/// alligned; }` and returns the firmware-assigned station index.
+///
+/// The trailing `alligned` byte is structure padding, so the firmware's
+/// declared payload length can trim it and deliver only three bytes; the
+/// station index and status still occupy the first two bytes, so accept any
+/// payload that carries through `pm_state`.
+pub(crate) fn parse_me_sta_add_confirmation(payload: &[u8]) -> Result<u8, AicError> {
+    if payload.len() < 3 {
+        return Err(AicError::MalformedResponse);
+    }
+    let (station_index, status) = (payload[0], payload[1]);
+    if status != 0 {
+        return Err(AicError::FirmwareRejected {
+            message_id: ME_STA_ADD_CFM,
+            status: u16::from(status),
+        });
+    }
+    (station_index != u8::MAX)
+        .then_some(station_index)
+        .ok_or(AicError::MalformedResponse)
+}
+
 pub(crate) fn disconnect_payload(interface_index: u8) -> [u8; 4] {
     [3, 0, interface_index, 0]
 }
@@ -433,7 +499,7 @@ mod tests {
 
     #[test]
     fn ap_start_confirmation_requires_the_requested_vif_and_complete_firmware_layout() {
-        assert_eq!(parse_ap_start(&[0, 1, 2, 3], 1), Ok(()));
+        assert_eq!(parse_ap_start(&[0, 1, 2, 3], 1), Ok(3));
         for payload in [
             &[0][..],
             &[0, 1, 2, 3, 0],
@@ -568,6 +634,56 @@ mod tests {
         assert_eq!(payload[103], 1);
         assert_eq!(payload[107], 1);
         assert_eq!(&payload[110..112], &[0; 2]);
+    }
+
+    #[test]
+    fn me_sta_add_uses_the_vendor_c_layout() {
+        let rates = [0x82, 0x84, 0x8b, 0x96, 0x0c, 0x12, 0x18, 0x24];
+        let payload = me_sta_add_payload([2, 0, 0, 0, 0, 1], &rates, 5, 3);
+
+        assert_eq!(payload.len(), ME_STA_ADD_LEN);
+        assert_eq!(&payload[0..6], &[2, 0, 0, 0, 0, 1]);
+        assert_eq!(payload[ME_STA_ADD_RATESET_LEN_OFFSET], rates.len() as u8);
+        assert_eq!(
+            &payload[ME_STA_ADD_RATESET_OFFSET..ME_STA_ADD_RATESET_OFFSET + rates.len()],
+            &rates
+        );
+        assert_eq!(&payload[19..20], &[0]); // unused rate slots stay zero
+        // flags (HT/VHT/HE present) stay zero across the capability region.
+        assert_eq!(&payload[20..ME_STA_ADD_AID_OFFSET], &[0; 104]);
+        assert_eq!(&payload[ME_STA_ADD_AID_OFFSET..126], &5u16.to_le_bytes());
+        assert_eq!(payload[ME_STA_ADD_VIF_OFFSET], 3);
+        assert_eq!(&payload[130..], &[0; 6]);
+    }
+
+    #[test]
+    fn me_sta_add_caps_rates_and_parses_the_station_index() {
+        let many = [0x0cu8; 20];
+        let payload = me_sta_add_payload([0; 6], &many, 1, 0);
+        assert_eq!(
+            payload[ME_STA_ADD_RATESET_LEN_OFFSET],
+            ME_STA_ADD_RATESET_MAX as u8
+        );
+
+        assert_eq!(parse_me_sta_add_confirmation(&[7, 0, 0, 0]), Ok(7));
+        // The firmware trims the trailing padding byte and confirms with only
+        // `sta_idx`/`status`/`pm_state`, as observed on hardware.
+        assert_eq!(parse_me_sta_add_confirmation(&[7, 0, 0]), Ok(7));
+        assert_eq!(
+            parse_me_sta_add_confirmation(&[0, 3, 0, 0]),
+            Err(AicError::FirmwareRejected {
+                message_id: ME_STA_ADD_CFM,
+                status: 3
+            })
+        );
+        assert_eq!(
+            parse_me_sta_add_confirmation(&[u8::MAX, 0, 0, 0]),
+            Err(AicError::MalformedResponse)
+        );
+        assert_eq!(
+            parse_me_sta_add_confirmation(&[7, 0]),
+            Err(AicError::MalformedResponse)
+        );
     }
 
     #[test]

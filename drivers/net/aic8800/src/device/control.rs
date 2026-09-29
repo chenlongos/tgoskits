@@ -3,9 +3,13 @@ use alloc::{boxed::Box, collections::VecDeque, vec, vec::Vec};
 use super::{AicError, ControlRequest, Entropy, Pmk};
 use crate::{
     lmac::{
-        ME_SET_CONTROL_PORT_CFM, ME_SET_CONTROL_PORT_REQ, MM_KEY_ADD_CFM, MM_KEY_ADD_REQ,
+        ME_CHAN_CONFIG_CFM, ME_CHAN_CONFIG_REQ, ME_CONFIG_CFM, ME_CONFIG_REQ,
+        ME_SET_CONTROL_PORT_CFM, ME_SET_CONTROL_PORT_REQ, ME_STA_ADD_CFM, ME_STA_ADD_REQ,
+        MM_ADD_IF_CFM, MM_ADD_IF_REQ, MM_KEY_ADD_CFM, MM_KEY_ADD_REQ, MM_RESET_CFM, MM_RESET_REQ,
         SM_CONNECT_CFM, SM_CONNECT_REQ, SM_DISCONNECT_CFM, SM_DISCONNECT_REQ, TASK_ME, TASK_MM,
-        TASK_SM, connect_payload, control_port_payload, disconnect_payload, key_add_payload,
+        TASK_SM, add_interface_payload, channel_config_payload, connect_payload,
+        control_port_payload, disconnect_payload, key_add_payload, me_config_payload,
+        me_sta_add_payload,
     },
     wpa2::{HandshakeAction, Wpa2Handshake, WpaError},
 };
@@ -31,6 +35,10 @@ pub(super) enum ControlOperation {
     Commands,
     Connect(Box<PendingConnect>),
     Disconnect,
+    /// Internal command queue of a running access point, used to register
+    /// associated clients with the firmware via `ME_STA_ADD`.  It carries no
+    /// waiting WEXT caller, so its completion must not raise `ControlComplete`.
+    ApStationAdd,
 }
 
 pub(super) struct PendingConnect {
@@ -82,6 +90,29 @@ impl ControlState {
         Ok(())
     }
 
+    /// Whether this control state is the access point's internal station-add
+    /// queue rather than a caller-driven connect/disconnect/scan operation.
+    pub(super) fn is_ap_station_add(&self) -> bool {
+        matches!(self.operation, ControlOperation::ApStationAdd)
+    }
+
+    pub(super) fn push_station_add(&mut self, command: ControlCommand) -> Result<(), AicError> {
+        self.push_command(command)
+    }
+
+    /// Creates the access point's internal control state carrying a single
+    /// `ME_STA_ADD`.  The interface only reports `Busy` to a new user request
+    /// while this transient state is alive, which clears once its confirmation
+    /// is handled.
+    pub(super) fn ap_station_add(command: ControlCommand) -> Self {
+        let command_bytes = command.payload.len();
+        Self {
+            commands: VecDeque::from([command]),
+            command_bytes,
+            operation: ControlOperation::ApStationAdd,
+        }
+    }
+
     pub(super) fn pop_command(&mut self) -> Option<ControlCommand> {
         let command = self.commands.pop_front()?;
         self.command_bytes -= command.payload.len();
@@ -89,8 +120,19 @@ impl ControlState {
     }
 
     pub(super) fn assign_ap_interface(&mut self, index: u8) -> Result<(), AicError> {
-        use crate::lmac::{APM_SET_BEACON_IE_REQ, APM_START_REQ, MM_ADD_IF_REQ};
-        if self.commands.front().map(|command| command.message_id) != Some(MM_ADD_IF_REQ) {
+        use crate::lmac::{APM_SET_BEACON_IE_REQ, APM_START_REQ, MM_ADD_IF_REQ, MM_RESET_REQ};
+        // After a MAC reset the reset confirmation has already been consumed,
+        // so the ADD_IF command is at the front; when no reset was issued the
+        // ADD_IF is already the head of the queue.
+        let front_is_reset =
+            self.commands.front().map(|command| command.message_id) == Some(MM_RESET_REQ);
+        let add_if_pos = if front_is_reset { 1 } else { 0 };
+        if self
+            .commands
+            .get(add_if_pos)
+            .map(|command| command.message_id)
+            != Some(MM_ADD_IF_REQ)
+        {
             return Err(AicError::CompletionMismatch);
         }
         self.pop_command();
@@ -104,11 +146,12 @@ impl ControlState {
         Ok(())
     }
 
-    pub(super) fn confirm_ap_start(&mut self, payload: &[u8]) -> Result<(), AicError> {
+    pub(super) fn confirm_ap_start(&mut self, payload: &[u8]) -> Result<u8, AicError> {
         let command = self.commands.front().ok_or(AicError::CompletionMismatch)?;
-        crate::lmac::parse_ap_start(payload, command.payload[APM_START_VIF_INDEX])?;
+        let bcmc_index =
+            crate::lmac::parse_ap_start(payload, command.payload[APM_START_VIF_INDEX])?;
         self.pop_command();
-        Ok(())
+        Ok(bcmc_index)
     }
 
     pub(super) fn accept_connect_indication(
@@ -304,7 +347,20 @@ pub(super) fn build(
             } else {
                 Some(entropy.ok_or(AicError::EntropyUnavailable)?)
             };
-            let interface_index = interface_index.ok_or(AicError::InvalidControlRequest)?;
+            // A prior MM_RESET_REQ (issued by the AP flow) clears every
+            // firmware VIF including the STA interface. Re-register the STA
+            // VIF before connecting so SM_CONNECT_REQ references a valid
+            // firmware slot; the confirmation handler patches the real
+            // firmware-assigned index into the connect command.
+            if interface_index.is_none() {
+                commands.push_back(ControlCommand {
+                    message_id: MM_ADD_IF_REQ,
+                    destination: TASK_MM,
+                    expected_message_id: MM_ADD_IF_CFM,
+                    payload: add_interface_payload(mac, 0).to_vec(),
+                });
+            }
+            let interface_index = interface_index.unwrap_or(0);
             commands.push_back(ControlCommand {
                 message_id: SM_DISCONNECT_REQ,
                 destination: TASK_SM,
@@ -339,6 +395,47 @@ pub(super) fn build(
             if ssid.is_empty() || ssid.len() > MAX_SSID_LENGTH || !(1..=14).contains(&channel) {
                 return Err(AicError::InvalidControlRequest);
             }
+            log::info!(
+                "[wifi] building AP commands: ssid=\"{}\" channel={} \
+                 mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                core::str::from_utf8(&ssid).unwrap_or("<invalid>"),
+                channel,
+                mac[0],
+                mac[1],
+                mac[2],
+                mac[3],
+                mac[4],
+                mac[5]
+            );
+            // The access point rides a full MAC bring-up, the sequence that
+            // board logs show lets a station associate and the control
+            // transaction finish (log20/log29): `MM_RESET` + `ME_CONFIG`
+            // re-establish the started MAC, then the channel, then the AP VIF
+            // built by `open_access_point_commands` below. Dropping the
+            // `MM_RESET`/`ME_CONFIG` pair to "ride boot's RF" (log30-log32)
+            // left the AP control transaction unable to complete and no client
+            // able to associate, so the pair is restored here. `MM_RESET` also
+            // makes its confirmation clear any stale station link, so AP data
+            // frames resolve through the AP VIF rather than a dead uplink.
+            commands.push_back(ControlCommand {
+                message_id: MM_RESET_REQ,
+                destination: TASK_MM,
+                expected_message_id: MM_RESET_CFM,
+                payload: Vec::new(),
+            });
+            commands.push_back(ControlCommand {
+                message_id: ME_CONFIG_REQ,
+                destination: TASK_ME,
+                expected_message_id: ME_CONFIG_CFM,
+                payload: me_config_payload().to_vec(),
+            });
+            commands.push_back(ControlCommand {
+                message_id: ME_CHAN_CONFIG_REQ,
+                destination: TASK_ME,
+                expected_message_id: ME_CHAN_CONFIG_CFM,
+                payload: channel_config_payload().to_vec(),
+            });
+            let _ = interface_index;
             commands.extend(open_access_point_commands(&ssid, channel, mac));
             ControlOperation::Commands
         }
@@ -355,6 +452,23 @@ pub(super) fn build(
         command_bytes,
         operation,
     })
+}
+
+/// Builds the `ME_STA_ADD_REQ` control command registering `peer` (identified
+/// by its MAC, the AID handed back in its association response and the legacy
+/// rates it advertised) on the access-point VIF `interface_index`.
+pub(super) fn ap_sta_add_command(
+    peer: [u8; 6],
+    rates: &[u8],
+    aid: u16,
+    interface_index: u8,
+) -> ControlCommand {
+    ControlCommand {
+        message_id: ME_STA_ADD_REQ,
+        destination: TASK_ME,
+        expected_message_id: ME_STA_ADD_CFM,
+        payload: me_sta_add_payload(peer, rates, aid, interface_index),
+    }
 }
 
 fn scan_command(ssid: Option<&[u8]>) -> ControlCommand {
@@ -407,7 +521,7 @@ const APM_START_VIF_INDEX: usize = 51;
 fn open_access_point_commands(ssid: &[u8], channel: u8, mac: [u8; 6]) -> VecDeque<ControlCommand> {
     use crate::lmac::{
         APM_SET_BEACON_IE_CFM, APM_SET_BEACON_IE_REQ, APM_START_CFM, APM_START_REQ, MM_ADD_IF_CFM,
-        MM_ADD_IF_REQ, MM_SET_FILTER_CFM, MM_SET_FILTER_REQ, MM_START_CFM, MM_START_REQ, TASK_MM,
+        MM_ADD_IF_REQ, MM_SET_FILTER_CFM, MM_SET_FILTER_REQ, TASK_MM,
     };
     let mut commands = VecDeque::new();
     let add_interface = crate::lmac::add_interface_payload(mac, 2).to_vec();
@@ -418,18 +532,20 @@ fn open_access_point_commands(ssid: &[u8], channel: u8, mac: [u8; 6]) -> VecDequ
         payload: add_interface,
     });
     commands.push_back(ControlCommand {
-        message_id: MM_START_REQ,
-        destination: TASK_MM,
-        expected_message_id: MM_START_CFM,
-        payload: crate::lmac::start_payload().to_vec(),
-    });
-    commands.push_back(ControlCommand {
         message_id: MM_SET_FILTER_REQ,
         destination: TASK_MM,
         expected_message_id: MM_SET_FILTER_CFM,
         payload: crate::lmac::filter_payload().to_vec(),
     });
     let (beacon, tim_offset) = open_beacon(ssid, channel, mac);
+    log::info!(
+        "[wifi] AP beacon: ssid=\"{}\" channel={} len={} tim_offset={} content={:02x?}",
+        core::str::from_utf8(ssid).unwrap_or("<invalid>"),
+        channel,
+        beacon.len(),
+        tim_offset,
+        beacon
+    );
     // Vendor `struct apm_set_bcn_ie_req` layout (natural alignment): vif_idx
     // at 0, one pad byte, bcn_ie_len u16 at 2, bcn_ie at 4. The vif index
     // comes from the ADD_IF confirmation and is pinned in by the mailbox
@@ -459,6 +575,13 @@ fn open_access_point_commands(ssid: &[u8], channel: u8, mac: [u8; 6]) -> VecDequ
     start[40..42].copy_from_slice(&100u16.to_le_bytes());
     start[48..50].copy_from_slice(&0x888eu16.to_be_bytes());
     start[50] = 6;
+    log::info!(
+        "[wifi] APM_START_REQ: freq={} MHz beacon_len={} tim_offset={} bcn_int=100 payload={:02x?}",
+        frequency,
+        beacon.len(),
+        tim_offset,
+        &start[..]
+    );
     commands.push_back(ControlCommand {
         message_id: APM_START_REQ,
         destination: 7,
@@ -477,7 +600,7 @@ fn open_beacon(ssid: &[u8], channel: u8, mac: [u8; 6]) -> (Vec<u8>, usize) {
     beacon.extend_from_slice(&[0, 0]);
     beacon.extend_from_slice(&[0; 8]);
     beacon.extend_from_slice(&100u16.to_le_bytes());
-    beacon.extend_from_slice(&0x0021u16.to_le_bytes());
+    beacon.extend_from_slice(&crate::ap::AP_CAPABILITY.to_le_bytes());
     beacon.extend_from_slice(&[0, ssid.len() as u8]);
     beacon.extend_from_slice(ssid);
     beacon.extend_from_slice(&[1, 8, 0x82, 0x84, 0x8b, 0x96, 0x0c, 0x12, 0x18, 0x24]);
