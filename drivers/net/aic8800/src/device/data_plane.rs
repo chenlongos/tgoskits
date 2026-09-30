@@ -341,7 +341,7 @@ impl AicDevice {
                                     if subtype == 12 { "DEAUTH" } else { "DISASSOC" },
                                     le16(24).unwrap_or(0),
                                 ),
-                                4 => log::info!(
+                                4 => log::debug!(
                                     "[wifi] rx PROBE_REQ dst={dst:02x?} src={src:02x?} \
                                      bssid={bssid:02x?} len={}",
                                     frame.len(),
@@ -353,7 +353,7 @@ impl AicDevice {
                                 ),
                             }
                         } else {
-                            log::info!(
+                            log::debug!(
                                 "[wifi] rx non-data frame fc={fc:#06x} type={ftype} \
                                  subtype={subtype} dec_status={} len={} raw={:02x?}",
                                 decryption_status,
@@ -372,7 +372,7 @@ impl AicDevice {
                         } else {
                             let dst = frame.get(..6).unwrap_or(&[]);
                             let src = frame.get(6..12).unwrap_or(&[]);
-                            log::info!(
+                            log::debug!(
                                 "[wifi] rx data frame \
                                  dst={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} \
                                  src={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} len={}",
@@ -477,7 +477,12 @@ impl AicDevice {
                     message_id,
                     payload,
                 } => {
-                    log::info!(
+                    // Unsolicited firmware indications (for example the
+                    // power-state `MM_PS_CHANGE_IND`) arrive on every poll and
+                    // carry no host-side meaning here; keep them off the
+                    // default `Info` stream so they do not drown the connect
+                    // and transaction logs.
+                    log::debug!(
                         "[wifi] unhandled firmware indication id={message_id:#06x}, payload={} \
                          bytes: {:02x?}",
                         payload.len(),

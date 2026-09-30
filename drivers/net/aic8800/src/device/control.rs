@@ -353,6 +353,35 @@ pub(super) fn build(
             // firmware slot; the confirmation handler patches the real
             // firmware-assigned index into the connect command.
             if interface_index.is_none() {
+                // Reaching a Connect with no tracked STA VIF means we are
+                // leaving an access point: the AP flow's `MM_RESET` and
+                // `APM_START` cleared `link.interface` but left the AP running
+                // in firmware. A bare `SM_DISCONNECT` cannot evict it, so the
+                // AP VIF/APM would keep beaming and reporting
+                // `MM_APM_STALOSS_IND` for the departed client, pinning the
+                // radio in an AP+STA conflict. Ride the same validated MAC
+                // bring-up the AP flow and cold startup use: `MM_RESET` (whose
+                // confirmation also clears the host AP/link state) plus
+                // `ME_CONFIG` and the band/channel table to re-establish a
+                // started MAC, then re-register the STA VIF below.
+                commands.push_back(ControlCommand {
+                    message_id: MM_RESET_REQ,
+                    destination: TASK_MM,
+                    expected_message_id: MM_RESET_CFM,
+                    payload: Vec::new(),
+                });
+                commands.push_back(ControlCommand {
+                    message_id: ME_CONFIG_REQ,
+                    destination: TASK_ME,
+                    expected_message_id: ME_CONFIG_CFM,
+                    payload: me_config_payload().to_vec(),
+                });
+                commands.push_back(ControlCommand {
+                    message_id: ME_CHAN_CONFIG_REQ,
+                    destination: TASK_ME,
+                    expected_message_id: ME_CHAN_CONFIG_CFM,
+                    payload: channel_config_payload().to_vec(),
+                });
                 commands.push_back(ControlCommand {
                     message_id: MM_ADD_IF_REQ,
                     destination: TASK_MM,
@@ -641,6 +670,43 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn connect_from_access_point_prepends_mac_bringup_to_evict_ap() {
+        let ids = |interface_index: Option<u8>| {
+            build(
+                ControlRequest::Connect {
+                    ssid: b"Tsinghua-Dongsheng".to_vec(),
+                    pmk: None,
+                    entropy: None,
+                },
+                [2, 0, 0, 0, 0, 1],
+                interface_index,
+            )
+            .unwrap()
+            .commands
+            .iter()
+            .map(|command| command.message_id)
+            .collect::<Vec<_>>()
+        };
+        // Leaving an AP (no tracked STA VIF): a full MAC bring-up must precede
+        // the STA re-registration so MM_RESET evicts the running access point
+        // instead of leaving it beaming and reporting station loss.
+        assert_eq!(
+            ids(None),
+            vec![
+                MM_RESET_REQ,
+                ME_CONFIG_REQ,
+                ME_CHAN_CONFIG_REQ,
+                MM_ADD_IF_REQ,
+                SM_DISCONNECT_REQ,
+                SM_CONNECT_REQ,
+            ]
+        );
+        // Riding an already-started MAC (first connect after boot): unchanged
+        // lightweight path with no reset prelude.
+        assert_eq!(ids(Some(0)), vec![SM_DISCONNECT_REQ, SM_CONNECT_REQ]);
     }
 
     #[test]

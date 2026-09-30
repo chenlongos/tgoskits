@@ -332,8 +332,11 @@ impl AicDevice {
                 let index = crate::lmac::parse_add_interface(&result)?;
                 if matches!(&control.operation, ControlOperation::Connect(_)) {
                     // A prior MAC reset cleared the STA VIF; the Connect flow
-                    // prepended MM_ADD_IF_REQ to re-register it. Patch the
-                    // firmware-assigned index into the pending SM_CONNECT_REQ.
+                    // prepended MM_ADD_IF_REQ to re-register it. Reinstate the
+                    // firmware-assigned index into the host link state so the
+                    // later SM_CONNECT_IND can match it in `install_peer`, and
+                    // patch the same index into the pending SM_CONNECT_REQ.
+                    self.data.link.install_interface(index)?;
                     if let Some(command) = control
                         .commands
                         .iter_mut()
@@ -825,6 +828,70 @@ mod tests {
             .unwrap();
         assert_eq!(beacon_upload.payload[0], 1);
         assert_eq!(apm_start.payload[51], 1);
+    }
+
+    #[test]
+    fn connect_add_if_confirmation_reinstates_sta_vif_for_install_peer() {
+        // AP→STA switch: a prior MM_RESET cleared the STA interface, so the
+        // Connect flow re-registers it via MM_ADD_IF_REQ. The confirmation must
+        // write the firmware-assigned VIF back into the host link state, or the
+        // later SM_CONNECT_IND cannot match it and `install_peer` rejects the
+        // (valid) association with MalformedResponse.
+        let mut device = AicDevice::new(ChipVariant::Aic8800D80).unwrap();
+        device.lifecycle.state = AicState::Ready;
+        device.data.link.install_mac([2, 0, 0, 0, 0, 1]).unwrap();
+        // Simulate the post-AP reset: no STA interface is currently tracked.
+        device.data.link.clear_interface();
+        let mut control = super::control::build(
+            ControlRequest::Connect {
+                ssid: b"Tsinghua-Dongsheng".to_vec(),
+                pmk: None,
+                entropy: None,
+            },
+            [2, 0, 0, 0, 0, 1],
+            None,
+        )
+        .unwrap();
+        // The leave-AP Connect window opens with a MAC bring-up
+        // (MM_RESET/ME_CONFIG/MECHAN); advance past those confirmations so
+        // MM_ADD_IF_REQ sits at the front, as on a real run.
+        while control.commands.front().map(|c| c.message_id) != Some(crate::lmac::MM_ADD_IF_REQ) {
+            control.commands.pop_front();
+        }
+        device.lifecycle.control = Some(control);
+        device.lifecycle.mailbox = Some(MailboxState {
+            frame: Vec::new(),
+            request: MailboxRequest::Lmac {
+                message_id: crate::lmac::MM_ADD_IF_REQ,
+            },
+            expected_message_id: crate::lmac::MM_ADD_IF_CFM,
+            phase: MailboxPhase::Complete,
+            deadline: MonotonicTime::from_nanos(1),
+            retry_at: None,
+            flow_retries: 0,
+            // status = 0, firmware assigns VIF index 1 (AP held slot 0).
+            result: Some(vec![0, 1]),
+        });
+
+        assert_eq!(device.complete_mailbox(), Ok(()));
+        assert_eq!(device.data.link.interface_index(), Some(1));
+        // The pending SM_CONNECT_REQ carries the same firmware-assigned index.
+        assert!(
+            device
+                .lifecycle
+                .control
+                .as_ref()
+                .unwrap()
+                .commands
+                .iter()
+                .find(|c| c.message_id == crate::lmac::SM_CONNECT_REQ)
+                .is_some_and(|c| c.payload[crate::lmac::SM_CONNECT_VIF_OFFSET] == 1)
+        );
+        // The association indication reports the same VIF; install_peer must now
+        // succeed rather than abort the transaction with MalformedResponse.
+        let bssid = [0xc4, 0x07, 0x78, 0xe7, 0x1d, 0xf0];
+        assert!(device.data.link.install_peer(1, 1, bssid).is_ok());
+        assert_eq!(device.data.link.peer(), Some((1, bssid)));
     }
 
     #[test]
