@@ -95,8 +95,11 @@ const SMALLCORE_SLOT_CAP: usize = 180 * 1024;
 const SMALLCORE_FLAG_SLOT: u32 = 1 << 2;
 /// 小核 JPU 已解码标志(bit3;与 ipc.rs FLAG_YUV 对齐)。
 const SMALLCORE_FLAG_YUV: u32 = 1 << 3;
-/// 小核 YUV 输出缓冲物理地址(必须与 bare-metal platform.rs YUV_BUF_PA 一致)。
-const SMALLCORE_YUV_PA: usize = 0x8FF5_E000;
+/// YUV 乒乓缓冲 A/B(必须与 bare-metal platform.rs YUV_A_PA/YUV_B_PA 一致)。
+const SMALLCORE_YUV_A_PA: usize = 0x8D00_0000;
+const SMALLCORE_YUV_B_PA: usize = 0x8D09_6000;
+/// YUV 乒乓槽索引(bit4;与 ipc.rs FLAG_YUV_SLOT 对齐)。
+const SMALLCORE_FLAG_YUV_SLOT: u32 = 1 << 4;
 /// live ioctl 9:全内核流水线(小核槽取帧 → JPU 解码 → PA 直通)。
 pub const CVI_CAMERA_IOCTL_DECODE_YUV420P_LIVE: u32 = 9;
 
@@ -135,6 +138,8 @@ impl SmallCoreSource {
     }
 
     /// 等下一帧(帧计数推进),从槽区拷入内核静态缓冲。
+    #[allow(dead_code)]
+    #[allow(dead_code)]
     fn frame(&mut self) -> Option<&'static [u8]> {
         let deadline = ax_runtime::hal::time::wall_time() + Duration::from_secs(3);
         let mut dbg_count = 0u32;
@@ -483,48 +488,20 @@ impl CviCamera {
                 let flags = aux as u32;
 
                 if (flags & SMALLCORE_FLAG_YUV) != 0 {
-                    // 小核 JPU 已解码——YUV 在固定 PA,直接返回。
+                    // 小核 JPU 已解码——YUV 在乒乓缓冲,按槽号选 PA。
+                    let yuv_pa = if (flags & SMALLCORE_FLAG_YUV_SLOT) != 0 {
+                        SMALLCORE_YUV_B_PA
+                    } else {
+                        SMALLCORE_YUV_A_PA
+                    };
                     drop(state);
-                    return Ok(SMALLCORE_YUV_PA);
+                    return Ok(yuv_pa);
                 }
 
-                // JPEG 模式(小核 JPU 失败回退):大核自己解。
-                let slot = ((flags & SMALLCORE_FLAG_SLOT) != 0) as usize;
-                if (4096..=SMALLCORE_SLOT_CAP).contains(&len) {
-                    let src_pa = sc.slots + slot * SMALLCORE_SLOT_CAP;
-                    let dst = core::ptr::addr_of_mut!(SMALLCORE_JPEG_BUF) as *mut u8;
-                    ax_hal::mem::dcache_range(
-                        ax_hal::mem::DCacheOp::Invalidate,
-                        ax_memory_addr::VirtAddr::from_usize(src_pa),
-                        len,
-                    );
-                    unsafe {
-                        core::ptr::copy_nonoverlapping(src_pa as *const u8, dst, len)
-                    };
-                    let (b0, b1) = unsafe { (*dst, *dst.add(1)) };
-                    if b0 == 0xff && b1 == 0xd8 {
-                        let jpeg: &'static [u8] = unsafe {
-                            core::slice::from_raw_parts(dst as *const u8, len)
-                        };
-                        // 大核 JPU 兜底解码
-                        drop(state);
-                        self.jpu
-                            .acquire_vdec()
-                            .map_err(|_| StarryError::ResourceBusy)?;
-                        let frame = match self.jpu.decode_vdec(
-                            jpeg,
-                            sg200x_jpu::JpuScale::Full,
-                        ) {
-                            Ok(f) => f,
-                            Err(e) => {
-                                self.jpu.release_vdec();
-                                return Err(e);
-                            }
-                        };
-                        self.jpu.release_vdec();
-                        return Ok(frame.dma_address as usize);
-                    }
-                }
+                // JPEG 模式(小核 JPU 暂未就绪):等待下一帧(小核 JPU
+                // 初始化后自动切到 YUV 模式)。大核不得用 JPU——JPU 是
+                // 单硬件单元,小核已占用,大核再编程会互相破坏(实测挂死)。
+                let _ = (len, flags);
             }
             if ax_runtime::hal::time::wall_time() > deadline {
                 warn!("cvi-camera: small-core frame timeout");
