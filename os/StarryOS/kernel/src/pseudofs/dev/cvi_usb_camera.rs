@@ -100,6 +100,12 @@ const SMALLCORE_FLAG_YUV: u32 = 1 << 3;
 /// 落点在 rtos 区 DRAM(不能用 HW 邮箱 ctx[2]——那是跨核日志行锁)。
 const SMALLCORE_FLOW_CREDIT_PA: usize = 0x8FEA_0000;
 
+/// 小核 YUV 帧最大长度(640×480 YUV422 = 614400;420 为 460800)。
+const SMALLCORE_YUV_CAP: usize = 640 * 480 * 2;
+/// 小核采集分辨率(固定 640×480;GET_INFO 在小核模式下用)。
+const SMALLCORE_FRAME_W: u16 = 640;
+const SMALLCORE_FRAME_H: u16 = 480;
+
 /// YUV 乒乓缓冲 A/B(必须与 bare-metal platform.rs YUV_A_PA/YUV_B_PA 一致)。
 const SMALLCORE_YUV_A_PA: usize = 0x8D00_0000;
 const SMALLCORE_YUV_B_PA: usize = 0x8D09_6000;
@@ -149,6 +155,57 @@ impl SmallCoreSource {
             Some(Self { mbox, slots, last_fc, flow, last_done: 0 })
         } else {
             None
+        }
+    }
+
+    /// 流控回写 + 等待下一帧小核 YUV,返回 (yuv_pa, yuv_len)。
+    ///
+    /// ioctl 9(零拷贝 PA 直通)与 ioctl 4(拷贝到用户态)共用:
+    /// - 先宣告「上一帧已消费完毕」(写流控信用 + dcache Clean);
+    /// - 轮询硬件邮箱 ctx 直到出现新的 FLAG_YUV 帧;
+    /// - 记录本帧为 last_done(下一轮调用开头才宣告,TPU/用户态正在读它)。
+    fn wait_next_yuv(&mut self) -> StarryResult<(usize, usize)> {
+        if self.last_done != 0 {
+            let flow = self.flow;
+            unsafe { core::ptr::write_volatile(flow as *mut u32, self.last_done) };
+            ax_hal::mem::dcache_range(
+                ax_hal::mem::DCacheOp::Clean,
+                ax_memory_addr::VirtAddr::from_usize(flow),
+                64,
+            );
+        }
+        let deadline = ax_runtime::hal::time::wall_time()
+            + core::time::Duration::from_secs(3);
+        loop {
+            let fc = unsafe {
+                core::ptr::read_volatile((self.mbox + SMALLCORE_CTX_OFF) as *const u32)
+            };
+            if fc != self.last_fc {
+                self.last_fc = fc;
+                let aux = unsafe {
+                    core::ptr::read_volatile(
+                        (self.mbox + SMALLCORE_CTX_OFF + 4) as *const u32,
+                    )
+                };
+                let len = (aux >> 8) as usize;
+                let flags = aux as u32;
+                if (flags & SMALLCORE_FLAG_YUV) != 0 && (2048..=SMALLCORE_YUV_CAP).contains(&len)
+                {
+                    let yuv_pa = if (flags & SMALLCORE_FLAG_YUV_SLOT) != 0 {
+                        SMALLCORE_YUV_B_PA
+                    } else {
+                        SMALLCORE_YUV_A_PA
+                    };
+                    self.last_done = fc;
+                    return Ok((yuv_pa, len));
+                }
+                // JPEG-only 帧(小核 JPU 暂未就绪):继续等 YUV 帧
+            }
+            if ax_runtime::hal::time::wall_time() > deadline {
+                warn!("cvi-camera: small-core YUV timeout");
+                return Err(StarryError::Io);
+            }
+            crate::task::sleep(core::time::Duration::from_micros(500));
         }
     }
 
@@ -431,6 +488,20 @@ impl UsbCameraState {
     }
 
     fn info(&mut self) -> StarryResult<CameraInfo> {
+        // 小核在线时:摄像头由小核独占,大核的 DWC2 从未 bring-up,
+        // ensure_initialized() 必然失败(ENODEV)。此时直接报固定参数——
+        // 真正取帧走 ioctl 9 的小核直通路径,不需要大核 USB 会话。
+        if self.smallcore.is_none() {
+            self.smallcore = SmallCoreSource::probe();
+        }
+        if self.smallcore.is_some() {
+            return Ok(CameraInfo {
+                width: SMALLCORE_FRAME_W,
+                height: SMALLCORE_FRAME_H,
+                format: CAMERA_FORMAT_MJPEG,
+                connected: 1,
+            });
+        }
         self.ensure_initialized()?;
         let session = self.session.as_ref().ok_or(StarryError::NoSuchDevice)?;
         Ok(CameraInfo {
@@ -471,9 +542,7 @@ impl CviCamera {
     /// TPU 可 DMA 直读的 PA)。返回值 = YUV 帧的 DMA 地址(0 = 内核内部失败
     /// 或小核不在线——用户态应回退旧路径)。
     fn decode_live(&self, _stage: usize) -> StarryResult<usize> {
-        // ── 小核 JPU 直通(2026-09-30 v2):小核已在硬件上完成 JPEG→YUV,
-        // 大核只需等帧号变化 + 检查 FLAG_YUV,直接返回 YUV PA(零 JPU 开销)。
-        // JPEG 回退路径保留(小核 JPU 失败时大核兜底)。
+        // ── 小核 JPU 直通:小核已在硬件上完成 JPEG→YUV,大核零 JPU 开销。
         let mut state = self.state.lock();
         if state.smallcore.is_none() {
             state.smallcore = SmallCoreSource::probe();
@@ -482,63 +551,9 @@ impl CviCamera {
             Some(s) => s,
             None => return Ok(0),
         };
-
-        // 等新帧(复用现有轮询逻辑)
-        // ── 流控回写:宣告「上一帧已消费完毕」(本次调用时 TPU 已读完它)。
-        // 小核据此判断乒乓缓冲是否可安全复用(见 bare-metal main.rs 流控段)。
-        if sc.last_done != 0 {
-            let flow = sc.flow;
-            unsafe { core::ptr::write_volatile(flow as *mut u32, sc.last_done) };
-            // 小核以 identity 映射读物理内存——必须把本核脏行写回 DRAM。
-            ax_hal::mem::dcache_range(
-                ax_hal::mem::DCacheOp::Clean,
-                ax_memory_addr::VirtAddr::from_usize(flow),
-                64,
-            );
-        }
-
-        let deadline = ax_runtime::hal::time::wall_time()
-            + core::time::Duration::from_secs(3);
-        loop {
-            let fc = unsafe {
-                core::ptr::read_volatile(
-                    (sc.mbox + SMALLCORE_CTX_OFF) as *const u32,
-                )
-            };
-            if fc != sc.last_fc {
-                sc.last_fc = fc;
-                let aux = unsafe {
-                    core::ptr::read_volatile(
-                        (sc.mbox + SMALLCORE_CTX_OFF + 4) as *const u32,
-                    )
-                };
-                let len = (aux >> 8) as usize;
-                let flags = aux as u32;
-
-                if (flags & SMALLCORE_FLAG_YUV) != 0 {
-                    // 小核 JPU 已解码——YUV 在乒乓缓冲,按槽号选 PA。
-                    let yuv_pa = if (flags & SMALLCORE_FLAG_YUV_SLOT) != 0 {
-                        SMALLCORE_YUV_B_PA
-                    } else {
-                        SMALLCORE_YUV_A_PA
-                    };
-                    // 记下本帧帧号;下一轮 ioctl 开头才宣告它已消费。
-                    sc.last_done = fc;
-                    drop(state);
-                    return Ok(yuv_pa);
-                }
-
-                // JPEG 模式(小核 JPU 暂未就绪):等待下一帧(小核 JPU
-                // 初始化后自动切到 YUV 模式)。大核不得用 JPU——JPU 是
-                // 单硬件单元,小核已占用,大核再编程会互相破坏(实测挂死)。
-                let _ = (len, flags);
-            }
-            if ax_runtime::hal::time::wall_time() > deadline {
-                warn!("cvi-camera: small-core frame timeout");
-                return Err(StarryError::Io);
-            }
-            crate::task::sleep(core::time::Duration::from_micros(500));
-        }
+        let (yuv_pa, _len) = sc.wait_next_yuv()?;
+        drop(state);
+        Ok(yuv_pa)
     }
 
     
@@ -568,11 +583,70 @@ impl CviCamera {
                 Ok(0)
             }
             CVI_CAMERA_IOCTL_GET_FRAME => {
+                // 小核在线:等 YUV 帧后拷贝到用户态缓冲(与 ioctl 9 共用
+                // 等帧+流控逻辑)。返回实际字节数——460800=I420,
+                // 614400=I422,由用户态按尺寸自适应格式。
+                {
+                    let mut state = self.state.lock();
+                    if state.smallcore.is_none() {
+                        state.smallcore = SmallCoreSource::probe();
+                    }
+                    if let Some(sc) = state.smallcore.as_mut() {
+                        let (yuv_pa, yuv_len) = sc.wait_next_yuv()?;
+                        // yuv_pa 是物理地址——必须转虚拟地址才能当指针读
+                        // (0x8D000000 直读 = EFAULT,踩过)。
+                        let src_va = axklib::mem::phys_to_virt(
+                            ax_memory_addr::PhysAddr::from_usize(yuv_pa),
+                        )
+                        .as_usize();
+                        // JPU DMA 写过乒乓缓冲:读前失效本核 cache 行,
+                        // 避免读到两帧前的陈旧行(缓冲隔帧复用)。
+                        ax_hal::mem::dcache_range(
+                            ax_hal::mem::DCacheOp::Invalidate,
+                            ax_memory_addr::VirtAddr::from_usize(src_va),
+                            yuv_len,
+                        );
+                        let src: &[u8] = unsafe {
+                            core::slice::from_raw_parts(src_va as *const u8, yuv_len)
+                        };
+                        vm_write_slice(current, arg as *mut u8, src)?;
+                        return Ok(yuv_len);
+                    }
+                }
                 let frame = self.state.lock().frame()?;
                 vm_write_slice(current, arg as *mut u8, frame)?;
                 Ok(frame.len())
             }
-            CVI_CAMERA_IOCTL_GET_YUV_FRAME => self.write_yuv_frame(current, arg as *mut u8),
+            CVI_CAMERA_IOCTL_GET_YUV_FRAME => {
+                // 小核在线:等 YUV 帧 + 拷贝到用户态(与 ioctl 9 共用等帧+流控)。
+                // 返回实际字节数——460800=I420(小核 JPU),614400=I422(大核)。
+                {
+                    let mut state = self.state.lock();
+                    if state.smallcore.is_none() {
+                        state.smallcore = SmallCoreSource::probe();
+                    }
+                    if let Some(sc) = state.smallcore.as_mut() {
+                        let (yuv_pa, yuv_len) = sc.wait_next_yuv()?;
+                        // yuv_pa 是物理地址——先转虚拟地址(直读 = EFAULT)。
+                        let src_va = axklib::mem::phys_to_virt(
+                            ax_memory_addr::PhysAddr::from_usize(yuv_pa),
+                        )
+                        .as_usize();
+                        // JPU DMA 写过乒乓缓冲:读前失效(缓冲隔帧复用)。
+                        ax_hal::mem::dcache_range(
+                            ax_hal::mem::DCacheOp::Invalidate,
+                            ax_memory_addr::VirtAddr::from_usize(src_va),
+                            yuv_len,
+                        );
+                        let src: &[u8] = unsafe {
+                            core::slice::from_raw_parts(src_va as *const u8, yuv_len)
+                        };
+                        vm_write_slice(current, arg as *mut u8, src)?;
+                        return Ok(yuv_len);
+                    }
+                }
+                self.write_yuv_frame(current, arg as *mut u8)
+            }
             CVI_CAMERA_IOCTL_DECODE_YUV420P_LIVE => self.decode_live(arg),
             _ => Err(StarryError::NotATty),
         }
