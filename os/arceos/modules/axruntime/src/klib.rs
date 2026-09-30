@@ -162,6 +162,10 @@ impl_trait! {
             ax_hal::mem::virt_to_phys(addr)
         }
 
+        fn mem_phys_to_virt(addr: PhysAddr) -> VirtAddr {
+            ax_hal::mem::phys_to_virt(addr)
+        }
+
         fn dma_cache_clean(addr: VirtAddr, size: usize) {
             dma_cache_range(ax_hal::mem::DCacheOp::Clean, addr, size);
         }

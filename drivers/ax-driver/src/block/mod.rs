@@ -11,6 +11,8 @@ mod irq_bound;
 
 #[cfg(feature = "cv181x-sdhci")]
 mod cvsd;
+#[cfg(feature = "ramdisk")]
+pub mod ramdisk;
 #[cfg(feature = "k230-sdhci")]
 mod k230_sdhci;
 #[cfg(feature = "nvme")]

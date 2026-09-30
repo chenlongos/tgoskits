@@ -74,6 +74,7 @@ rockchip-sdhci = [
     "dep:sdmmc-protocol",
     "sdmmc-protocol/rdif",
 ]
+ramdisk = ["block", "dep:ramdisk", "dep:ax-memory-addr"]
 cv181x-sdhci = [
     "block",
     "dep:cv181x-sdhci",
@@ -177,6 +178,7 @@ pbkdf2 = { workspace = true, optional = true }
 phytium-mci-host = { workspace = true, optional = true }
 rd-net = { workspace = true, optional = true }
 rdif-block = { workspace = true, optional = true }
+ramdisk = { workspace = true, optional = true }
 rdif-clk = { workspace = true, optional = true }
 rdif-display = { workspace = true, optional = true }
 rdif-gpu = { workspace = true, optional = true }

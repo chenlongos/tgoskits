@@ -128,6 +128,11 @@ pub trait Klib {
     /// Translates a kernel virtual address to the corresponding physical address.
     fn mem_virt_to_phys(addr: VirtAddr) -> PhysAddr;
 
+    /// Translates a physical address inside the kernel linear map to its
+    /// virtual alias. Only valid for memory covered by the direct map
+    /// (e.g. reserved DRAM regions), not for arbitrary device MMIO.
+    fn mem_phys_to_virt(addr: PhysAddr) -> VirtAddr;
+
     /// Maps newly allocated pages through an independent uncached kernel alias.
     ///
     /// This is not a general-purpose memory attribute switching API. Callers
@@ -271,7 +276,7 @@ pub mod cpu {
 pub mod mem {
     pub use super::klib::{
         mem_iomap as iomap, mem_map_dma_coherent_uncached as map_dma_coherent_uncached,
-        mem_unmap_dma_coherent as unmap_dma_coherent, mem_virt_to_phys as virt_to_phys,
+        mem_unmap_dma_coherent as unmap_dma_coherent, mem_virt_to_phys as virt_to_phys, mem_phys_to_virt as phys_to_virt,
     };
 }
 

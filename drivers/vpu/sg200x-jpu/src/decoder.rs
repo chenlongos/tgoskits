@@ -633,25 +633,62 @@ fn downsample_chroma(
     let output_width = width.div_ceil(2);
     let output_height = height.div_ceil(2);
     let count = (step_x * step_y) as u16;
-    for y in 0..output_height {
-        for x in 0..output_width {
-            let mut sum = 0u16;
-            for dy in 0..step_y {
-                let row = (y * step_y + dy).min(source_height - 1);
-                for dx in 0..step_x {
-                    let column = (x * step_x + dx).min(source_width - 1);
-                    sum += u16::from(bytes[source.offset + row * source.stride as usize + column]);
-                }
+    let src_stride = source.stride as usize;
+    let dst_stride = destination.stride as usize;
+
+    // ── 快路径:step=(1,2)(YUV422H→420,最常见)──
+    // u64 宽读:8 源像素/迭代,总线事务和指令数降 8 倍。
+    // (avg(a,b) = ((a+b)+1)>>1 等价于原 (sum + count/2)/count,count=2)
+    if (step_x, step_y) == (1, 2) && output_width >= 8 {
+        let chunk = output_width / 8; // 完整 u64 块数
+        let _tail = output_width % 8;  // 尾部逐字节
+        for y in 0..output_height {
+            let r0 = source.offset + (y * 2).min(source_height - 1) * src_stride;
+            let r1 = source.offset + (y * 2 + 1).min(source_height - 1) * src_stride;
+            let d = destination.offset + y * dst_stride;
+            for c in 0..chunk {
+                // SAFETY: r0/r1/d + c*8..+8 均在 bytes 范围内
+                // (stride ≥ width,offset+height*stride ≤ total_len)。
+                let a = unsafe { bytes.as_ptr().add(r0 + c * 8).cast::<u64>().read_unaligned() };
+                let b = unsafe { bytes.as_ptr().add(r1 + c * 8).cast::<u64>().read_unaligned() };
+                // SWAR 逐字节 round-half-up 平均:
+                // floor = (a&b) + (((a^b) & 0xFE..) >> 1)   ← 掩码先清各字节 LSB 再移,防跨字节
+                // odd   = (a^b) & 0x01..                     ← a+b 为奇数的字节
+                // avg   = floor + odd                        ← (floor ≤ 254, odd ≤ 1,无字节进位)
+                let xor = a ^ b;
+                let floor = (a & b).wrapping_add((xor & 0xFEFE_FEFE_FEFE_FEFE) >> 1);
+                let avg = floor.wrapping_add(xor & 0x0101_0101_0101_0101);
+                unsafe { bytes.as_mut_ptr().add(d + c * 8).cast::<u64>().write_unaligned(avg) };
             }
-            bytes[destination.offset + y * destination.stride as usize + x] =
-                ((sum + count / 2) / count) as u8;
+            // 尾部(不足 8 像素)
+            for x in (chunk * 8)..output_width {
+                let va = bytes[r0 + x] as u16;
+                let vb = bytes[r1 + x] as u16;
+                bytes[d + x] = (((va + vb) + 1) >> 1) as u8;
+            }
+        }
+    } else {
+        // ── 通用慢路径(其它 step 组合,保持原语义)──
+        for y in 0..output_height {
+            for x in 0..output_width {
+                let mut sum = 0u16;
+                for dy in 0..step_y {
+                    let row = (y * step_y + dy).min(source_height - 1);
+                    for dx in 0..step_x {
+                        let column = (x * step_x + dx).min(source_width - 1);
+                        sum += u16::from(bytes[source.offset + row * src_stride + column]);
+                    }
+                }
+                bytes[destination.offset + y * dst_stride + x] =
+                    ((sum + count / 2) / count) as u8;
+            }
         }
     }
-    // Do not let source samples survive in output row or bottom padding.
+    // 行尾清零(不变)
     for y in 0..destination.storage.height as usize {
-        let row = destination.offset + y * destination.stride as usize;
+        let row = destination.offset + y * dst_stride;
         let used = if y < output_height { output_width } else { 0 };
-        bytes[row + used..row + destination.stride as usize].fill(0);
+        bytes[row + used..row + dst_stride].fill(0);
     }
 }
 

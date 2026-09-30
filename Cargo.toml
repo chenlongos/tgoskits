@@ -7,6 +7,8 @@ repository = "https://github.com/rcore-os/tgoskits"
 keywords = ["arceos", "kernel"]
 categories = ["os", "no-std"]
 
+exclude = ["test-suit/axvisor/normal/board-orangepi-5-plus/task-switch-overhead/guest"]
+
 [profile.release]
 # Optimize the scheduler/runtime boundary across crate and codegen-unit edges.
 lto = "fat"
@@ -15,7 +17,6 @@ lto = "fat"
 resolver = "3"
 members = [
     "apps/starry/orangepi-5-plus-uvc/rust",
-    "test-suit/axvisor/normal/board-orangepi-5-plus/task-switch-overhead/guest",
 
     "bootloader/axloader",
 
@@ -208,6 +209,7 @@ axvirtio-net = { version = "0.2", path = "virtualization/axvirtio-net" }
 axvm = { version = "0.8", path = "virtualization/axvm", default-features = false }
 axvm-types = { version = "0.7", path = "virtualization/axvm-types" }
 axvmconfig = { version = "0.8", path = "virtualization/axvmconfig", default-features = false }
+ramdisk = { version = "0.1.11", path = "drivers/blk/ramdisk" }
 ahci-driver = { version = "0.2", path = "drivers/blk/ahci-driver" }
 
 define-simple-traits = { version = "0.3", path = "components/crate_interface/test_crates/define-simple-traits" }

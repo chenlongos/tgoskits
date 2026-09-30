@@ -14,3 +14,11 @@ axvisor = "run -p tg-xtask -- axvisor"
 starry = "run -p tg-xtask -- starry"
 xtask = "run -p tg-xtask --"
 board = "run -p tg-xtask -- board"
+
+# Cross-compile bindgen support (2026-09-29 migration from upstream dev)
+[env]
+LIBCLANG_PATH = "/home/yfblock/lib-fix"
+BINDGEN_EXTRA_CLANG_ARGS = "--sysroot=/home/yfblock/toolchains/riscv64-linux-musl-cross/riscv64-linux-musl"
+CC_riscv64gc-unknown-linux-musl = "riscv64-linux-musl-gcc"
+AR_riscv64gc-unknown-linux-musl = "riscv64-linux-musl-ar"
+CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_MUSL_LINKER = "riscv64-linux-musl-gcc"

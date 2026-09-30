@@ -37,7 +37,7 @@ rga = ["ax-driver/rga", "dep:rockchip-rga"]
 k230-kpu = ["ax-hal/riscv-thead-mae", "dep:k230-kpu"]
 dynamic_debug = []
 sg2002 = [
-    "ax-driver/usb",
+    "ax-driver/ramdisk",
     "dep:sg2002-tpu",
     "dep:some-serial",
     "dep:sg200x-bsp",

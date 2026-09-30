@@ -28,9 +28,12 @@ pub fn init(args: &[String], envs: &[String]) {
 /// Starts an init candidate on the root already selected during boot.
 pub fn init_candidates(paths: &[String], init_args: &[String], envs: &[String]) {
     // Install task-context diagnostics and contention backoff before userspace.
+    info!("[SOS] init step 1");
     crate::rdrive_osal::init();
 
+    info!("[SOS] init step 2");
     crate::stop_machine::init();
+    info!("[SOS] init step 3");
     crate::trap::init_handlers();
     static_keys::global_init();
     crate::cgroup::init();
@@ -41,6 +44,7 @@ pub fn init_candidates(paths: &[String], init_args: &[String], envs: &[String]) 
     crate::perf::perf_event_init();
     crate::kmod::init_kmod();
 
+    info!("[SOS] init step 4");
     pseudofs::mount_all().expect("Failed to mount pseudofs");
     crate::file::epoll::start_epoll_notify_worker();
     spawn_alarm_task();
@@ -59,6 +63,7 @@ pub fn init_candidates(paths: &[String], init_args: &[String], envs: &[String]) 
 
     ax_alloc::register_page_reclaim_fn(ax_fs_ng::vfs::page_cache_reclaim);
 
+    info!("[SOS] trying init candidates");
     let mut selected = None;
     for candidate in paths {
         let Ok(loc) = current_fs_context().lock().resolve(candidate) else {

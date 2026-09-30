@@ -137,6 +137,7 @@ pub(crate) fn runtime_default_task_stack_size() -> usize {
 }
 
 fn ax_app_entry() {
+    ax_log::info!("[SOS] ax_app_entry: entering");
     #[cfg(all(feature = "std-compat", not(test)))]
     {
         unsafe extern "C" {
