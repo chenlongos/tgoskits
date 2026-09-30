@@ -45,6 +45,25 @@ pub fn init_candidates(paths: &[String], init_args: &[String], envs: &[String]) 
     crate::kmod::init_kmod();
 
     info!("[SOS] init step 4");
+
+    // ── 关闭小核启动的 DW APB WDT(0x03010000)——containment 策略 ──
+    // 该 WDT 由小核固件启动(0.34s 超时,小核 mtimer 每 10ms 喂),复位是
+    // **全片性质**。TPU 用户态 runtime 直接 mmap TPU MMIO 自驱 TDMA,其
+    // 偶发野写(~10-30%)会打死小核 → 喂狗停 → 0.34s 后整板复位 reboot
+    // (实测:串口二进制乱流+板重启,crash 点聚类在 TPU 模型加载/推理期)。
+    // 内核模式下关掉它:小核死 = 摄像头停流(akars 收 ioctl 超时、可安全
+    // 停车/留日志),而不是丢失全板状态。b2sbm 裸机路径无内核执行此处,
+    // WDT 保持开启(静默 wedge 自愈语义不变)。
+    // CR(0x00): bit0=EN。先解锁?DW WDT 无锁定寄存器,直接清 EN。
+    {
+        use ax_hal::mem::PhysAddr;
+        let wdt_cr = ax_mm::iomap(PhysAddr::from_usize(0x0301_0000), 0x1000)
+            .expect("iomap WDT")
+            .as_usize();
+        unsafe { core::ptr::write_volatile(wdt_cr as *mut u32, 0) };
+        info!("[SOS] DW-WDT disabled (containment: small-core death stays non-fatal)");
+    }
+
     pseudofs::mount_all().expect("Failed to mount pseudofs");
     crate::file::epoll::start_epoll_notify_worker();
     spawn_alarm_task();
