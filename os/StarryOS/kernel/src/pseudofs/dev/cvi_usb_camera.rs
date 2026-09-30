@@ -93,6 +93,10 @@ const SMALLCORE_HB_OFF: usize = 0x41C;
 const SMALLCORE_SLOT0_PA: usize = 0x8FEC_0000;
 const SMALLCORE_SLOT_CAP: usize = 180 * 1024;
 const SMALLCORE_FLAG_SLOT: u32 = 1 << 2;
+/// 小核 JPU 已解码标志(bit3;与 ipc.rs FLAG_YUV 对齐)。
+const SMALLCORE_FLAG_YUV: u32 = 1 << 3;
+/// 小核 YUV 输出缓冲物理地址(必须与 bare-metal platform.rs YUV_BUF_PA 一致)。
+const SMALLCORE_YUV_PA: usize = 0x8FF5_E000;
 /// live ioctl 9:全内核流水线(小核槽取帧 → JPU 解码 → PA 直通)。
 pub const CVI_CAMERA_IOCTL_DECODE_YUV420P_LIVE: u32 = 9;
 
@@ -163,13 +167,6 @@ impl SmallCoreSource {
                     unsafe { core::ptr::copy_nonoverlapping(src as *const u8, dst, len) };
                     let (b0, b1) = unsafe { (*dst, *dst.add(1)) };
                     if b0 == 0xff && b1 == 0xd8 {
-                        warn!(
-                            "[F1] polls={} inv={}µs copy={}µs len={}B",
-                            dbg_count,
-                            (t_inv1 - t_inv0).as_micros(),
-                            (t_cp1 - t_inv1).as_micros(),
-                            len,
-                        );
                         return Some(unsafe { core::slice::from_raw_parts(dst as *const u8, len) });
                     }
                     warn!("cvi-camera: small-core frame bad header len={len}; skip");
@@ -454,48 +451,90 @@ impl CviCamera {
     /// TPU 可 DMA 直读的 PA)。返回值 = YUV 帧的 DMA 地址(0 = 内核内部失败
     /// 或小核不在线——用户态应回退旧路径)。
     fn decode_live(&self, _stage: usize) -> StarryResult<usize> {
-        // —— 全链路计时:lock/frame/acq/jpu/rel ——
-        let jpeg: &'static [u8] = {
-            let mut state = self.state.lock();
-            let t_lock = ax_runtime::hal::time::wall_time();
-            if state.smallcore.is_none() {
-                state.smallcore = SmallCoreSource::probe();
-            }
-            let r = match state.smallcore.as_mut() {
-                Some(sc) => sc.frame().ok_or(StarryError::Io)?,
-                None => return Ok(0),
+        // ── 小核 JPU 直通(2026-09-30 v2):小核已在硬件上完成 JPEG→YUV,
+        // 大核只需等帧号变化 + 检查 FLAG_YUV,直接返回 YUV PA(零 JPU 开销)。
+        // JPEG 回退路径保留(小核 JPU 失败时大核兜底)。
+        let mut state = self.state.lock();
+        if state.smallcore.is_none() {
+            state.smallcore = SmallCoreSource::probe();
+        }
+        let sc = match state.smallcore.as_mut() {
+            Some(s) => s,
+            None => return Ok(0),
+        };
+
+        // 等新帧(复用现有轮询逻辑)
+        let deadline = ax_runtime::hal::time::wall_time()
+            + core::time::Duration::from_secs(3);
+        loop {
+            let fc = unsafe {
+                core::ptr::read_volatile(
+                    (sc.mbox + SMALLCORE_CTX_OFF) as *const u32,
+                )
             };
-            warn!(
-                "[D1] lock={}µs frame={}µs",
-                (t_lock - t0).as_micros(),
-                (t_frame_end - t_lock).as_micros(),
-            );
-            r
-        };
-        let jpeg_len = jpeg.len();
-        self.jpu.acquire_vdec().map_err(|_| StarryError::ResourceBusy)?;
-        let frame = match self
-            .jpu
-            .decode_vdec(jpeg, sg200x_jpu::JpuScale::Full)
-        {
-            Ok(frame) => frame,
-            Err(e) => {
-                self.jpu.release_vdec();
-                return Err(e);
+            if fc != sc.last_fc {
+                sc.last_fc = fc;
+                let aux = unsafe {
+                    core::ptr::read_volatile(
+                        (sc.mbox + SMALLCORE_CTX_OFF + 4) as *const u32,
+                    )
+                };
+                let len = (aux >> 8) as usize;
+                let flags = aux as u32;
+
+                if (flags & SMALLCORE_FLAG_YUV) != 0 {
+                    // 小核 JPU 已解码——YUV 在固定 PA,直接返回。
+                    drop(state);
+                    return Ok(SMALLCORE_YUV_PA);
+                }
+
+                // JPEG 模式(小核 JPU 失败回退):大核自己解。
+                let slot = ((flags & SMALLCORE_FLAG_SLOT) != 0) as usize;
+                if (4096..=SMALLCORE_SLOT_CAP).contains(&len) {
+                    let src_pa = sc.slots + slot * SMALLCORE_SLOT_CAP;
+                    let dst = core::ptr::addr_of_mut!(SMALLCORE_JPEG_BUF) as *mut u8;
+                    ax_hal::mem::dcache_range(
+                        ax_hal::mem::DCacheOp::Invalidate,
+                        ax_memory_addr::VirtAddr::from_usize(src_pa),
+                        len,
+                    );
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(src_pa as *const u8, dst, len)
+                    };
+                    let (b0, b1) = unsafe { (*dst, *dst.add(1)) };
+                    if b0 == 0xff && b1 == 0xd8 {
+                        let jpeg: &'static [u8] = unsafe {
+                            core::slice::from_raw_parts(dst as *const u8, len)
+                        };
+                        // 大核 JPU 兜底解码
+                        drop(state);
+                        self.jpu
+                            .acquire_vdec()
+                            .map_err(|_| StarryError::ResourceBusy)?;
+                        let frame = match self.jpu.decode_vdec(
+                            jpeg,
+                            sg200x_jpu::JpuScale::Full,
+                        ) {
+                            Ok(f) => f,
+                            Err(e) => {
+                                self.jpu.release_vdec();
+                                return Err(e);
+                            }
+                        };
+                        self.jpu.release_vdec();
+                        return Ok(frame.dma_address as usize);
+                    }
+                }
             }
-        };
-        self.jpu.release_vdec();
-        warn!(
-            "[D2] acq={}µs jpu={}µs rel={}µs | jpeg={}B total={}µs",
-            (t_acq1 - t_acq0).as_micros(),
-            (t_dec - t_acq1).as_micros(),
-            (t_end - t_dec).as_micros(),
-            jpeg_len,
-            (t_end - t0).as_micros(),
-        );
-        Ok(frame.dma_address as usize)
+            if ax_runtime::hal::time::wall_time() > deadline {
+                warn!("cvi-camera: small-core frame timeout");
+                return Err(StarryError::Io);
+            }
+            crate::task::sleep(core::time::Duration::from_micros(500));
+        }
     }
 
+    
     fn ioctl_inner(
         &self,
         current: &crate::task::UserTaskRef,
