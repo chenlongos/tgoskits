@@ -100,6 +100,14 @@ const SMALLCORE_FLAG_YUV: u32 = 1 << 3;
 /// 落点在 rtos 区 DRAM(不能用 HW 邮箱 ctx[2]——那是跨核日志行锁)。
 const SMALLCORE_FLOW_CREDIT_PA: usize = 0x8FEA_0000;
 
+/// I420 staging 乒乓(内核把小核的 I422 转成模型要的 I420 后放这里,
+/// TPU DMA 直读)。位于 YUV 外置预留区内(YUV A/B 之后,4MB memreserve 内):
+///   YUV A [0x8D000000, 0x8D096000)  YUV B [0x8D096000, 0x8D12C000)
+///   I420 A [0x8D140000, 0x8D1B0800) I420 B [0x8D1B1000, 0x8D221800)
+const SMALLCORE_I420_A_PA: usize = 0x8D14_0000;
+const SMALLCORE_I420_B_PA: usize = 0x8D1B_1000;
+const SMALLCORE_I420_SIZE: usize = 640 * 480 * 3 / 2; // 460800
+const SMALLCORE_Y_SIZE: usize = 640 * 480; // 307200
 /// 小核 YUV 帧最大长度(640×480 YUV422 = 614400;420 为 460800)。
 const SMALLCORE_YUV_CAP: usize = 640 * 480 * 2;
 /// 小核采集分辨率(固定 640×480;GET_INFO 在小核模式下用)。
@@ -119,10 +127,39 @@ pub const CVI_CAMERA_IOCTL_DECODE_YUV420P_LIVE: u32 = 9;
 /// 编译期可证明的独占访问(camera state 锁内)。
 static mut SMALLCORE_JPEG_BUF: [u8; SMALLCORE_SLOT_CAP] = [0; SMALLCORE_SLOT_CAP];
 
+/// 色度平面垂直 2:1 下采样(I422→I420),u64 SWAR 字节平均。
+/// 源是 JPU DMA 写的乒乓缓冲——volatile 读;目标走正常 cache(调用方 Clean)。
+///
+/// SWAR 平均公式(无进位字节平均,对每个字节独立):
+///   floor = (a & b) + ((a^b & 0xFE..) >> 1)
+///   avg   = floor + (a^b & 0x01..)
+unsafe fn swar_vdown(src: usize, dst: usize, width_bytes: usize, src_rows: usize) {
+    let qwords = width_bytes / 8;
+    for r in 0..(src_rows / 2) {
+        let s0 = src + (2 * r) * width_bytes;
+        let s1 = s0 + width_bytes;
+        let d = dst + r * width_bytes;
+        for i in 0..qwords {
+            let (a, b) = unsafe {
+                (
+                    core::ptr::read_volatile((s0 + i * 8) as *const u64),
+                    core::ptr::read_volatile((s1 + i * 8) as *const u64),
+                )
+            };
+            let xor = a ^ b;
+            let floor = (a & b).wrapping_add((xor & 0xFEFE_FEFE_FEFE_FEFE) >> 1);
+            let avg = floor.wrapping_add(xor & 0x0101_0101_0101_0101);
+            unsafe { core::ptr::write_volatile((d + i * 8) as *mut u64, avg) };
+        }
+    }
+}
+
 struct SmallCoreSource {
     mbox: usize,
     slots: usize,
     last_fc: u32,
+    /// I420 staging 乒乓翻转(false=A, true=B)。
+    staging_flip: bool,
     /// 流控信用单元的虚拟地址(rtos 区 DRAM)。
     flow: usize,
     /// 上一次已**完成消费**(TPU 读完)的帧号——流控信用,回写给小核。
@@ -152,7 +189,7 @@ impl SmallCoreSource {
             let last_fc =
                 unsafe { core::ptr::read_volatile((mbox + SMALLCORE_CTX_OFF) as *const u32) };
             info!("cvi-camera: detected hb {hb}->{hb2} fc={last_fc:#x}");
-            Some(Self { mbox, slots, last_fc, flow, last_done: 0 })
+            Some(Self { mbox, slots, last_fc, staging_flip: false, flow, last_done: 0 })
         } else {
             None
         }
@@ -551,7 +588,63 @@ impl CviCamera {
             Some(s) => s,
             None => return Ok(0),
         };
-        let (yuv_pa, _len) = sc.wait_next_yuv()?;
+        let (yuv_pa, yuv_len) = sc.wait_next_yuv()?;
+        // 相机 JPEG 是 422 子采样 → 小核 JPU 输出 I422(614400B),但模型
+        // 输入是 I420(460800B)。直通会把 I422 当 I420 喂 TPU——色度平面
+        // 错位,检测色彩损坏(live 只测时间不查精度,曾长期未暴露)。
+        // 此处做 Y 直拷 + U/V 2:1 SWAR 下采样到 staging 乒乓,TPU DMA 直读。
+        if yuv_len != SMALLCORE_I420_SIZE {
+            let src_va = axklib::mem::phys_to_virt(
+                ax_memory_addr::PhysAddr::from_usize(yuv_pa),
+            )
+            .as_usize();
+            // 源是 JPU DMA 写入:读前失效本核 cache(缓冲隔帧复用)
+            ax_hal::mem::dcache_range(
+                ax_hal::mem::DCacheOp::Invalidate,
+                ax_memory_addr::VirtAddr::from_usize(src_va),
+                yuv_len,
+            );
+            let dst_pa = if sc.staging_flip {
+                SMALLCORE_I420_B_PA
+            } else {
+                SMALLCORE_I420_A_PA
+            };
+            sc.staging_flip = !sc.staging_flip;
+            let dst_va = axklib::mem::phys_to_virt(
+                ax_memory_addr::PhysAddr::from_usize(dst_pa),
+            )
+            .as_usize();
+            unsafe {
+                // Y 平面直拷(307200B)
+                core::ptr::copy_nonoverlapping(
+                    src_va as *const u8,
+                    dst_va as *mut u8,
+                    SMALLCORE_Y_SIZE,
+                );
+                // U 平面:153600B(320×480) → 76800B(320×240)
+                swar_vdown(
+                    src_va + SMALLCORE_Y_SIZE,
+                    dst_va + SMALLCORE_Y_SIZE,
+                    320,
+                    480,
+                );
+                // V 平面:偏移 460800(I422) → 384000(I420)
+                swar_vdown(
+                    src_va + 2 * SMALLCORE_Y_SIZE,
+                    dst_va + SMALLCORE_Y_SIZE + 76800,
+                    320,
+                    480,
+                );
+            }
+            // 本核经 cache 写入 staging:TPU DMA 读物理内存,必须写回
+            ax_hal::mem::dcache_range(
+                ax_hal::mem::DCacheOp::Clean,
+                ax_memory_addr::VirtAddr::from_usize(dst_va),
+                SMALLCORE_I420_SIZE,
+            );
+            drop(state);
+            return Ok(dst_pa);
+        }
         drop(state);
         Ok(yuv_pa)
     }

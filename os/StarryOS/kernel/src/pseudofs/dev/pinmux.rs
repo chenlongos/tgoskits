@@ -1,6 +1,6 @@
-use core::{any::Any, str};
+use core::{any::Any, str, sync::atomic::{AtomicUsize, Ordering}};
 
-use ax_hal::mem::{PhysAddr, phys_to_virt};
+use ax_hal::mem::PhysAddr;
 use axfs_ng_vfs::{NodeFlags, VfsError, VfsResult};
 use bytemuck::AnyBitPattern;
 
@@ -30,11 +30,27 @@ impl PinmuxDev {
         }
     }
 
+    /// FMUX 的 iomap 虚拟地址(0 = 未映射)。MMIO 区**不能**走 phys_to_virt
+    /// 线性映射——线性映射只覆盖 DRAM,对 MMIO PA 的 VA 写入 = Supervisor
+    /// Page Fault(实测 panic @VA:0xffffffc003001070,踩过)。
+    fn fmux_vaddr() -> VfsResult<usize> {
+        static FMUX_VA: AtomicUsize = AtomicUsize::new(0);
+        let cached = FMUX_VA.load(Ordering::Acquire);
+        if cached != 0 {
+            return Ok(cached);
+        }
+        let va = ax_mm::iomap(PhysAddr::from_usize(FMUX_PBASE), 0x1000)
+            .map_err(|_| VfsError::Io)?
+            .as_usize();
+        FMUX_VA.store(va, Ordering::Release);
+        Ok(va)
+    }
+
     fn write_fmux(offset: usize, value: u32) -> VfsResult<()> {
         if offset >= FMUX_SIZE || !offset.is_multiple_of(4) {
             return Err(VfsError::InvalidInput);
         }
-        let vaddr = phys_to_virt(PhysAddr::from_usize(FMUX_PBASE + offset)).as_usize();
+        let vaddr = Self::fmux_vaddr()? + offset;
         unsafe {
             core::ptr::write_volatile(vaddr as *mut u32, value);
         }
