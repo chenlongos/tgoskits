@@ -95,6 +95,11 @@ const SMALLCORE_SLOT_CAP: usize = 180 * 1024;
 const SMALLCORE_FLAG_SLOT: u32 = 1 << 2;
 /// 小核 JPU 已解码标志(bit3;与 ipc.rs FLAG_YUV 对齐)。
 const SMALLCORE_FLAG_YUV: u32 = 1 << 3;
+/// 流控信用单元(与 bare-metal platform.rs FLOW_CREDIT_PA 一致)。
+/// 大核在此回写「已完成消费的帧号」,小核据此判断乒乓缓冲能否复用。
+/// 落点在 rtos 区 DRAM(不能用 HW 邮箱 ctx[2]——那是跨核日志行锁)。
+const SMALLCORE_FLOW_CREDIT_PA: usize = 0x8FEA_0000;
+
 /// YUV 乒乓缓冲 A/B(必须与 bare-metal platform.rs YUV_A_PA/YUV_B_PA 一致)。
 const SMALLCORE_YUV_A_PA: usize = 0x8D00_0000;
 const SMALLCORE_YUV_B_PA: usize = 0x8D09_6000;
@@ -112,6 +117,12 @@ struct SmallCoreSource {
     mbox: usize,
     slots: usize,
     last_fc: u32,
+    /// 流控信用单元的虚拟地址(rtos 区 DRAM)。
+    flow: usize,
+    /// 上一次已**完成消费**(TPU 读完)的帧号——流控信用,回写给小核。
+    /// 必须延迟一整轮再回写:本次 ioctl 返回的 PA 正被 TPU 读取,
+    /// 此时若宣告该帧已消费,小核会立刻覆盖同一乒乓缓冲。
+    last_done: u32,
 }
 
 impl SmallCoreSource {
@@ -124,6 +135,10 @@ impl SmallCoreSource {
             ax_memory_addr::PhysAddr::from_usize(SMALLCORE_SLOT0_PA),
         )
         .as_usize();
+        let flow = axklib::mem::phys_to_virt(
+            ax_memory_addr::PhysAddr::from_usize(SMALLCORE_FLOW_CREDIT_PA),
+        )
+        .as_usize();
         let hb = unsafe { core::ptr::read_volatile((mbox + SMALLCORE_HB_OFF) as *const u32) };
         crate::task::sleep(Duration::from_millis(50));
         let hb2 = unsafe { core::ptr::read_volatile((mbox + SMALLCORE_HB_OFF) as *const u32) };
@@ -131,7 +146,7 @@ impl SmallCoreSource {
             let last_fc =
                 unsafe { core::ptr::read_volatile((mbox + SMALLCORE_CTX_OFF) as *const u32) };
             info!("cvi-camera: detected hb {hb}->{hb2} fc={last_fc:#x}");
-            Some(Self { mbox, slots, last_fc })
+            Some(Self { mbox, slots, last_fc, flow, last_done: 0 })
         } else {
             None
         }
@@ -469,6 +484,19 @@ impl CviCamera {
         };
 
         // 等新帧(复用现有轮询逻辑)
+        // ── 流控回写:宣告「上一帧已消费完毕」(本次调用时 TPU 已读完它)。
+        // 小核据此判断乒乓缓冲是否可安全复用(见 bare-metal main.rs 流控段)。
+        if sc.last_done != 0 {
+            let flow = sc.flow;
+            unsafe { core::ptr::write_volatile(flow as *mut u32, sc.last_done) };
+            // 小核以 identity 映射读物理内存——必须把本核脏行写回 DRAM。
+            ax_hal::mem::dcache_range(
+                ax_hal::mem::DCacheOp::Clean,
+                ax_memory_addr::VirtAddr::from_usize(flow),
+                64,
+            );
+        }
+
         let deadline = ax_runtime::hal::time::wall_time()
             + core::time::Duration::from_secs(3);
         loop {
@@ -494,6 +522,8 @@ impl CviCamera {
                     } else {
                         SMALLCORE_YUV_A_PA
                     };
+                    // 记下本帧帧号;下一轮 ioctl 开头才宣告它已消费。
+                    sc.last_done = fc;
                     drop(state);
                     return Ok(yuv_pa);
                 }
