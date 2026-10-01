@@ -628,10 +628,13 @@ impl CviCamera {
                     320,
                     480,
                 );
-                // V 平面:偏移 460800(I422) → 384000(I420)
+                // V 平面:I422 布局 Y(307200) + U(153600) = V 起点 460800。
+                // 踩坑:曾写成 2*SMALLCORE_Y_SIZE(614400)——越界读到下一块
+                // 乒乓缓冲的 Y 平面,TPU 的红色度 = 错帧亮度 → 黄球色彩特征
+                // 消失,置信度从 ~0.8 崩到 0.3(检测看似"失明")。
                 swar_vdown(
-                    src_va + 2 * SMALLCORE_Y_SIZE,
-                    dst_va + SMALLCORE_Y_SIZE + 76800,
+                    src_va + SMALLCORE_Y_SIZE + 153_600,
+                    dst_va + SMALLCORE_Y_SIZE + 76_800,
                     320,
                     480,
                 );
