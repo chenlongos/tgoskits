@@ -198,6 +198,23 @@ impl<T: Kind> Ns16550Irq<T> {
         ier.remove(interrupt_enable_for_events(events));
         self.base.write_flags(UART_IER, ier);
     }
+
+    /// Drops the receiver FIFO and its read pointer to clear a receive
+    /// indication that draining cannot reach. A DesignWare character timeout (or
+    /// a spurious data-available) can stay latched in IIR while the FIFO reads
+    /// empty and LSR shows no data or error; an incoming byte would clear it,
+    /// otherwise only a receiver-FIFO reset does. Without this the owner task's
+    /// next re-arm re-enables the same asserted level line and the storm
+    /// resumes. Self-clearing bit; the trigger level matches `enable_fifo` so
+    /// the re-arm threshold is unchanged.
+    fn reset_rx_fifo(&self) {
+        self.base.write_flags(
+            UART_FCR,
+            FifoControlFlags::ENABLE_FIFO
+                | FifoControlFlags::CLEAR_RECEIVER_FIFO
+                | FifoControlFlags::TRIGGER_8_BYTES,
+        );
+    }
 }
 
 impl<T: Kind> UartIrq for Ns16550Irq<T> {
@@ -252,10 +269,24 @@ impl<T: Kind> UartIrq for Ns16550Irq<T> {
             }
         }
 
+        // A UART can latch a receive indication in IIR (received-data-available
+        // or the DesignWare character-timeout flavor) while its FIFO reads empty
+        // and no line error is set. Draining cannot clear that phantom source, so
+        // leaving RX enabled lets the level IRQ line re-assert on every completion
+        // and starve the owner CPU. A bare mask is not enough either: the owner
+        // task re-arms RX on the still-latched line and the storm resumes. So on a
+        // phantom first reset the receiver FIFO to drop the latch (what an
+        // incoming byte would otherwise do), then mask RX and hand rearm back to
+        // the owner task on a now-quiescent source.
+        let phantom_rx = event.events.has_rx() && rx.is_empty();
         let defer_rx = rx.len() == IRQ_RX_BATCH_CAPACITY
             || event.rx_errors.contains(RxErrorFlags::OVERRUN)
-            || (pass_budget_exhausted && event.events.has_rx());
+            || (pass_budget_exhausted && event.events.has_rx())
+            || phantom_rx;
         if defer_rx && !event.events.contains(SerialEventSet::FAULT) {
+            if phantom_rx {
+                self.reset_rx_fifo();
+            }
             self.mask_sources(SerialEventSet::RX);
             event.rearm |= SerialEventSet::RX;
         }
@@ -1637,6 +1668,35 @@ mod tests {
         assert!(event.rx_errors.contains(RxErrorFlags::OVERRUN));
         assert!(event.rearm.contains(SerialEventSet::RX));
         assert_eq!(REGS[UART_IER as usize].load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn irq_phantom_rx_with_empty_fifo_resets_fifo_and_masks_rx() {
+        let (_guard, uart) = serial();
+        let mut parts = started_parts(uart);
+        REGS[UART_IER as usize].store(UART_IER_RDI | UART_IER_RLSI, Ordering::SeqCst);
+        // IIR reports a receive source while the FIFO reads empty: LSR carries no
+        // data-ready and no error, so draining yields no byte and the indication
+        // cannot be cleared at the device.
+        REGS[UART_IIR as usize].store(UART_IIR_RDI, Ordering::SeqCst);
+        REGS[UART_LSR as usize].store(0, Ordering::SeqCst);
+        // `startup` already wrote FCR; clear the record so only a reset issued by
+        // this handler pass can be observed below.
+        LAST_FCR_WRITE.store(0, Ordering::SeqCst);
+
+        let event = handle_irq(&mut parts.irq).0.unwrap();
+
+        // The handler still reports the observed RX event but must defer it, not
+        // leave RX armed and storm. It first resets the receiver FIFO to drop the
+        // latched indication (what an incoming byte would otherwise do), then
+        // masks the receive sources and requests a task-side rearm on the now
+        // quiescent line, all without ever touching RBR.
+        assert!(event.events.has_rx());
+        assert!(event.rearm.contains(SerialEventSet::RX));
+        assert_eq!(REGS[UART_IER as usize].load(Ordering::SeqCst), 0);
+        assert_eq!(RBR_READS.load(Ordering::SeqCst), 0);
+        let fcr = FifoControlFlags::from_bits_retain(LAST_FCR_WRITE.load(Ordering::SeqCst));
+        assert!(fcr.contains(FifoControlFlags::CLEAR_RECEIVER_FIFO));
     }
 
     #[test]

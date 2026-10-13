@@ -19,6 +19,17 @@ use crate::{RuntimeError, RuntimeResult};
 const RX_BUDGET: usize = 256;
 const TX_BUDGET: usize = 64;
 
+// A phantom receive indication that survives both draining and a receiver FIFO
+// reset keeps re-arming through the owner task: every `rearm(RX)` re-enables a
+// still-asserted level line and the interrupt returns at once. The hardirq
+// masks RX again and only this worker re-arms, so the worker cadence *is* the
+// storm rate. Once this many consecutive interrupt-driven receive passes drain
+// no byte, pause before re-arming so the masked line cannot storm and the other
+// CPU-pinned workers make progress. A single real byte clears the latch and
+// resets the streak, restoring full-rate interrupt-driven receive.
+const PHANTOM_RX_BACKOFF_STREAK: usize = 4;
+const PHANTOM_RX_BACKOFF: Duration = Duration::from_millis(2);
+
 pub(super) struct SerialWorker {
     shared: Arc<RuntimeShared>,
     irq_rx: SpscConsumer<RxSample>,
@@ -34,6 +45,7 @@ pub(super) struct SerialWorker {
     pending_rearm: SerialEventSet,
     immediate_events: SerialEventSet,
     latched_rx_errors: RxErrorFlags,
+    phantom_rx_streak: usize,
 }
 
 impl SerialWorker {
@@ -58,6 +70,7 @@ impl SerialWorker {
             pending_rearm: SerialEventSet::empty(),
             immediate_events: SerialEventSet::empty(),
             latched_rx_errors: RxErrorFlags::empty(),
+            phantom_rx_streak: 0,
         }
     }
 
@@ -114,8 +127,22 @@ impl SerialWorker {
                 if path == RxPath::Port {
                     self.port_rx_ready = false;
                 }
+                // Backing off a latched phantom: `service_rx` no longer re-arms
+                // RX while this is active (see the Port-drain guard there), so
+                // pausing here caps the storm at roughly one re-arm per interval
+                // and yields the CPU that the other pinned workers share. A real
+                // byte clears the latch and resets the streak, restoring
+                // full-rate interrupt-driven receive.
+                if self.phantom_backoff_active() {
+                    crate::task::thread::current::sleep(PHANTOM_RX_BACKOFF);
+                }
                 let outcome = self.service_rx(path);
                 rx_blocked = outcome.blocked;
+                if outcome.served > 0 {
+                    self.phantom_rx_streak = 0;
+                } else if !outcome.blocked && !self.shared.polling {
+                    self.phantom_rx_streak = self.phantom_rx_streak.saturating_add(1);
+                }
                 if worker_budget_requires_yield(outcome.budget_exhausted) {
                     yield_after_worker_budget();
                     continue;
@@ -426,19 +453,25 @@ impl SerialWorker {
         }
 
         if path == RxPath::Port && source_drained {
-            let shared = self.shared.clone();
-            let ready = shared
-                .with_port(|port| {
-                    rearm_drained_rx(
-                        true,
-                        self.shared.polling,
-                        &mut self.pending_rearm,
-                        |sources| port.rearm(sources),
-                    )
-                })
-                .unwrap_or_default();
-            if ready.has_rx() {
-                self.port_rx_ready = true;
+            // While backing off a phantom latch, leave RX masked so the worker
+            // falls through to `service_tx` instead of being driven back to the
+            // top of the loop by a synchronous re-fire. `rearm_sources` then
+            // re-enables RX once per throttled cycle, after TX has drained.
+            if !self.phantom_backoff_active() {
+                let shared = self.shared.clone();
+                let ready = shared
+                    .with_port(|port| {
+                        rearm_drained_rx(
+                            true,
+                            self.shared.polling,
+                            &mut self.pending_rearm,
+                            |sources| port.rearm(sources),
+                        )
+                    })
+                    .unwrap_or_default();
+                if ready.has_rx() {
+                    self.port_rx_ready = true;
+                }
             }
         } else if path == RxPath::Port {
             self.port_rx_ready = true;
@@ -452,6 +485,7 @@ impl SerialWorker {
         RxServiceOutcome {
             blocked,
             budget_exhausted: !blocked && processed == RX_BUDGET && source_pending,
+            served: processed,
         }
     }
 
@@ -636,6 +670,16 @@ impl SerialWorker {
         self.pending_control.is_some() || self.pending_drain.is_some()
     }
 
+    /// A phantom receive latch is being rate-limited: enough consecutive
+    /// receive passes drained no byte that the worker now pauses before each
+    /// re-arm. While active, `service_rx` must not re-enable RX itself, or the
+    /// level line re-fires before the worker reaches `service_tx` and output
+    /// stalls; the single re-enable per throttled cycle happens in
+    /// `rearm_sources` after TX drains.
+    fn phantom_backoff_active(&self) -> bool {
+        self.phantom_rx_streak >= PHANTOM_RX_BACKOFF_STREAK && !self.shared.polling
+    }
+
     fn rearm_sources(&mut self) {
         let sources = tx_rearm_sources(
             core::mem::take(&mut self.pending_rearm),
@@ -799,6 +843,7 @@ fn prepare_rx_output(
 struct RxServiceOutcome {
     blocked: bool,
     budget_exhausted: bool,
+    served: usize,
 }
 
 struct TxServiceOutcome {

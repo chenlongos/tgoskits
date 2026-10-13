@@ -1130,11 +1130,12 @@ pub(crate) fn try_publish_record(
         .shared
         .stats
         .add_log_dropped_records(outcome.dropped_records());
-    match record_wake_context(
+    let wake_context = record_wake_context(
         outcome.published(),
         ax_hal::irq::in_irq_context(),
         log_wake_ready,
-    ) {
+    );
+    match wake_context {
         RecordWakeContext::Interrupt => {
             runtime.shared.bridge.notify();
         }
