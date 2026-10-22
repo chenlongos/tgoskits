@@ -7,5 +7,5 @@ features = [
   "ax-driver/cv181x-sdhci",
   "ax-driver/aic8800-wifi",
 ]
-log = "Warn"
+log = "Info"
 target = "riscv64gc-unknown-none-elf"
