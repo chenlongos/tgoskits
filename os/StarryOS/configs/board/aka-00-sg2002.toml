@@ -5,6 +5,7 @@ features = [
   "axplat-dyn/thead-mae",
   "ax-driver/serial",
   "ax-driver/cv181x-sdhci",
+  "ax-driver/aic8800-wifi",
 ]
 log = "Warn"
 target = "riscv64gc-unknown-none-elf"
