@@ -1023,6 +1023,11 @@ impl Service {
                     if let Some(server) = dhcp_server.as_mut()
                         && let Some(reply) = server.process_packet(interface_id, packet)
                     {
+                        log::info!(
+                            "[dhcp-srv] dev {}: generated DHCP reply ({} bytes)",
+                            server.dev,
+                            reply.len()
+                        );
                         dhcp_server_replies.push((server.dev, reply));
                     }
                 });

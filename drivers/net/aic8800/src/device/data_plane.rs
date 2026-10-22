@@ -6,12 +6,17 @@ use crate::{
     lmac::{
         SM_CONNECT_IND, SM_DISCONNECT_IND, parse_connect_indication, parse_disconnect_indication,
     },
-    protocol::{BLOCK_SIZE, ethernet_tx_frame},
+    protocol::{BLOCK_SIZE, ethernet_tx_frame, mgmt_tx_frame},
     registers::ReceiveLength,
     rx::{ParsedFrame, parse_fifo},
 };
 
 const IO_RETRY: Duration = Duration::from_millis(1);
+// Access points have no peer traffic to raise CARD_INT while they idle, so a
+// bare interrupt wait lets the firmware's per-beacon indication and beacon-TX
+// completion queue back up until the transmitter stalls. Wake on this interval
+// (well inside the ~102 ms beacon period) to drain one bounded scan.
+const AP_RX_POLL: Duration = Duration::from_millis(50);
 // The firmware reports packet buffers, not SDIO blocks. Keep two buffers
 // available for commands, as in the vendor DATA_FLOW_CTRL_THRESH contract.
 const DATA_TX_RESERVED_CREDITS: u8 = 2;
@@ -73,6 +78,19 @@ impl AicDevice {
                 read_byte(self.data_function(), self.registers().flow_control),
             );
         }
+        // A running access point keeps emitting beacons whose per-beacon
+        // indications and TX-completion credits land on the receive FIFO. The
+        // firmware halts the beacon transmitter once that queue is not
+        // drained, and with no associated peer nothing else re-asserts
+        // CARD_INT, so parking on a bare interrupt wait permanently silences
+        // the AP. Arm one bounded receive scan and wake on a timer instead:
+        // each wake drains at most one scan and then releases the owner lock
+        // until the next interval, so the queue keeps draining without
+        // starving callers the way an unparked rescan loop would.
+        if self.data.ap.is_some() {
+            self.request_receive_scan();
+            return AicAction::WaitForInterruptUntil(now.after(AP_RX_POLL));
+        }
         AicAction::WaitForInterrupt
     }
 
@@ -102,6 +120,7 @@ impl AicDevice {
             // completes, so a second scan must never be queued here.
             return;
         }
+        log::debug!("[wifi] CARD_INT: arming receive scan");
         self.io.receive.active = true;
         self.io.receive.next_path = 0;
     }
@@ -131,6 +150,7 @@ impl AicDevice {
         match self.registers().receive_length(count) {
             ReceiveLength::Empty => self.advance_receive_path(),
             ReceiveLength::OtherInterrupt => {
+                log::info!("[wifi] rx scan {path:?}: other interrupt (count={count:#04x})");
                 // The vendor D80 IRQ handler acknowledges the dev-to-host soft
                 // IRQ here: read the interrupt-pending register, clear bit 0,
                 // and write it back. Without the acknowledgement the pending
@@ -148,6 +168,11 @@ impl AicDevice {
                 ));
             }
             ReceiveLength::Blocks(blocks) => {
+                log::debug!(
+                    "[wifi] rx scan {path:?}: {} blocks ({} bytes, count={count:#04x})",
+                    blocks,
+                    usize::from(blocks) * BLOCK_SIZE
+                );
                 self.io.next = Some((
                     IoPurpose::ReceiveData(path),
                     read_fifo(
@@ -158,6 +183,7 @@ impl AicDevice {
                 ));
             }
             ReceiveLength::ByteMode => {
+                log::info!("[wifi] rx scan {path:?}: byte mode (count={count:#04x})");
                 self.io.next = Some((
                     IoPurpose::ReceiveByteLength(path),
                     read_byte(
@@ -232,6 +258,11 @@ impl AicDevice {
         response: SdioResponse,
     ) -> Result<(), AicError> {
         let receive_data = expect_data(response)?;
+        log::debug!(
+            "[wifi] rx data {path:?}: {} bytes raw: {:02x?}",
+            receive_data.len(),
+            &receive_data[..receive_data.len().min(64)]
+        );
         let frames =
             parse_fifo(&receive_data, self.mailbox_confirmation_id()).map_err(|error| {
                 let header_length = receive_data.len().min(24);
@@ -262,12 +293,103 @@ impl AicDevice {
                     decryption_status,
                 } => {
                     let Some(frames) = decapsulate_data_frames(&frame, decryption_status) else {
+                        let fc = u16::from_le_bytes([
+                            frame.first().copied().unwrap_or(0),
+                            frame.get(1).copied().unwrap_or(0),
+                        ]);
+                        let ftype = (fc >> 2) & 0x3;
+                        let subtype = (fc >> 4) & 0xf;
+                        let le16 = |off: usize| {
+                            frame
+                                .get(off..off + 2)
+                                .map(|b| u16::from_le_bytes([b[0], b[1]]))
+                        };
+                        // Read-only diagnostic decode of 802.11 management
+                        // frames so AP association events can be correlated
+                        // without touching the control plane. Addresses follow
+                        // the standard 24-byte management header layout.
+                        let dst = frame.get(4..10).unwrap_or(&[]);
+                        let src = frame.get(10..16).unwrap_or(&[]);
+                        let bssid = frame.get(16..22).unwrap_or(&[]);
+                        if ftype == 0 {
+                            match subtype {
+                                11 => log::info!(
+                                    "[wifi] rx AUTH dst={dst:02x?} src={src:02x?} \
+                                     bssid={bssid:02x?} algo={:#04x} seq={:?} status={:#04x} \
+                                     len={}",
+                                    le16(24).unwrap_or(0),
+                                    le16(26),
+                                    le16(28).unwrap_or(0),
+                                    frame.len(),
+                                ),
+                                0 => log::info!(
+                                    "[wifi] rx ASSOC_REQ dst={dst:02x?} src={src:02x?} \
+                                     bssid={bssid:02x?} cap={:#04x} len={}",
+                                    le16(24).unwrap_or(0),
+                                    frame.len(),
+                                ),
+                                1 => log::info!(
+                                    "[wifi] rx ASSOC_RESP dst={dst:02x?} src={src:02x?} \
+                                     bssid={bssid:02x?} cap={:#04x} status={:#04x} aid={:?}",
+                                    le16(24).unwrap_or(0),
+                                    le16(26).unwrap_or(0),
+                                    le16(28),
+                                ),
+                                10 | 12 => log::info!(
+                                    "[wifi] rx {} dst={dst:02x?} src={src:02x?} \
+                                     bssid={bssid:02x?} reason={:#04x}",
+                                    if subtype == 12 { "DEAUTH" } else { "DISASSOC" },
+                                    le16(24).unwrap_or(0),
+                                ),
+                                4 => log::debug!(
+                                    "[wifi] rx PROBE_REQ dst={dst:02x?} src={src:02x?} \
+                                     bssid={bssid:02x?} len={}",
+                                    frame.len(),
+                                ),
+                                _ => log::debug!(
+                                    "[wifi] rx mgmt subtype={subtype} dst={dst:02x?} \
+                                     src={src:02x?} bssid={bssid:02x?} len={}",
+                                    frame.len(),
+                                ),
+                            }
+                        } else {
+                            log::debug!(
+                                "[wifi] rx non-data frame fc={fc:#06x} type={ftype} \
+                                 subtype={subtype} dec_status={} len={} raw={:02x?}",
+                                decryption_status,
+                                frame.len(),
+                                &frame[..frame.len().min(48)]
+                            );
+                        }
+                        if ftype == 0 {
+                            self.maybe_respond_ap_mgmt(&frame, subtype);
+                        }
                         continue;
                     };
                     for frame in frames {
                         if frame.get(12..14) == Some(&ETHERTYPE_EAPOL) {
                             self.consume_eapol(&frame)?;
                         } else {
+                            let dst = frame.get(..6).unwrap_or(&[]);
+                            let src = frame.get(6..12).unwrap_or(&[]);
+                            log::debug!(
+                                "[wifi] rx data frame \
+                                 dst={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} \
+                                 src={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} len={}",
+                                dst[0],
+                                dst[1],
+                                dst[2],
+                                dst[3],
+                                dst[4],
+                                dst[5],
+                                src[0],
+                                src[1],
+                                src[2],
+                                src[3],
+                                src[4],
+                                src[5],
+                                frame.len()
+                            );
                             self.data.push_event(AicEvent::Receive(frame))?;
                         }
                     }
@@ -281,8 +403,11 @@ impl AicDevice {
                 ParsedFrame::DataConfirmation => {
                     log::trace!("AIC firmware data confirmation");
                 }
-                ParsedFrame::FirmwarePrint { length } => {
-                    log::trace!("AIC firmware trace frame: {length} bytes");
+                ParsedFrame::FirmwarePrint { length, content } => {
+                    let text = core::str::from_utf8(&content)
+                        .unwrap_or("<binary>")
+                        .trim_end_matches('\0');
+                    log::info!("[wifi] AIC firmware trace ({length} bytes): \"{text}\"");
                 }
                 ParsedFrame::Indication {
                     message_id: SM_CONNECT_IND,
@@ -352,9 +477,16 @@ impl AicDevice {
                     message_id,
                     payload,
                 } => {
-                    log::trace!(
-                        "AIC indication id={message_id:#06x}, payload={} bytes",
-                        payload.len()
+                    // Unsolicited firmware indications (for example the
+                    // power-state `MM_PS_CHANGE_IND`) arrive on every poll and
+                    // carry no host-side meaning here; keep them off the
+                    // default `Info` stream so they do not drown the connect
+                    // and transaction logs.
+                    log::debug!(
+                        "[wifi] unhandled firmware indication id={message_id:#06x}, payload={} \
+                         bytes: {:02x?}",
+                        payload.len(),
+                        payload
                     );
                 }
             }
@@ -382,6 +514,7 @@ impl AicDevice {
             .as_mut()
             .ok_or(AicError::CompletionMismatch)?;
         if credits <= DATA_TX_RESERVED_CREDITS {
+            log::debug!("[wifi] tx flow: credits={credits} below reserved, retrying");
             active.retry_at = Some(now.after(IO_RETRY));
             return Ok(());
         }
@@ -405,6 +538,9 @@ impl AicDevice {
                 self.data.push_event(AicEvent::TransmitComplete(token))?
             }
             super::owner::TxCompletion::Internal(super::owner::InternalTxKind::M2) => {}
+            super::owner::TxCompletion::Internal(super::owner::InternalTxKind::ApMgmt) => {
+                log::info!("[wifi] ap mgmt tx confirmed");
+            }
             super::owner::TxCompletion::Internal(super::owner::InternalTxKind::M4) => {
                 let (station_index, _) = self.data.link.peer().ok_or(AicError::WpaProtocol)?;
                 self.lifecycle
@@ -421,18 +557,33 @@ impl AicDevice {
         if self.data.active_tx.is_some() {
             return;
         }
-        let Some((interface_index, station_index)) = self.data.link.tx_indices() else {
-            return;
-        };
+        let uses_header_crc = self.transport_uses_header_crc();
+        // Host-originated frames (station EAPOL and access-point management
+        // responses) carry their own firmware indices, so they are emitted
+        // before the peer-dependent gate below; an access point has no
+        // associated peer to resolve through `tx_indices`.
         if let Some(internal) = self.data.pop_internal_tx() {
-            let Ok(wire_frame) = ethernet_tx_frame(
-                &internal.ethernet_frame,
-                interface_index,
-                station_index,
-                self.transport_uses_header_crc(),
-            ) else {
+            let built = match &internal.frame {
+                super::owner::InternalTxFrame::Ethernet(ethernet) => ethernet_tx_frame(
+                    ethernet,
+                    internal.interface_index,
+                    internal.station_index,
+                    uses_header_crc,
+                ),
+                super::owner::InternalTxFrame::Mgmt(raw) => {
+                    mgmt_tx_frame(raw, internal.interface_index, uses_header_crc)
+                }
+            };
+            let Ok(wire_frame) = built else {
                 return;
             };
+            if matches!(&internal.frame, super::owner::InternalTxFrame::Mgmt(_)) {
+                log::info!(
+                    "[wifi] ap mgmt tx emit wire_len={} if={}",
+                    wire_frame.len(),
+                    internal.interface_index,
+                );
+            }
             self.data.active_tx = Some(ActiveTx {
                 retry_at: None,
                 completion: super::owner::TxCompletion::Internal(internal.kind),
@@ -440,15 +591,25 @@ impl AicDevice {
             });
             return;
         }
-        let Some(frame) = self.data.tx.take_wire_frame(
-            interface_index,
-            station_index,
-            self.transport_uses_header_crc(),
-        ) else {
+        let Some((interface_index, station_index)) = self.resolve_next_tx_indices() else {
+            return;
+        };
+        let Some(frame) =
+            self.data
+                .tx
+                .take_wire_frame(interface_index, station_index, uses_header_crc)
+        else {
             return;
         };
         match frame {
             Ok((token, wire_frame)) => {
+                if self.data.ap.is_some() {
+                    log::debug!(
+                        "[wifi] ap data tx emit if={interface_index} sta={station_index} \
+                         wire_len={}",
+                        wire_frame.len(),
+                    );
+                }
                 self.data.active_tx = Some(ActiveTx {
                     retry_at: None,
                     completion: super::owner::TxCompletion::User(token),
@@ -460,6 +621,31 @@ impl AicDevice {
                 .events
                 .push_back(AicEvent::TransmitComplete(token)),
         }
+    }
+
+    /// Resolves the firmware interface and station indices the next host frame
+    /// must be transmitted with.  A running access point owns the radio: it
+    /// sends on the AP VIF and picks the destination client's firmware station
+    /// from the association table, falling back to the BC/MC station the
+    /// firmware returned in `APM_START_CFM` for a broadcast or unregistered
+    /// destination.  The firmware has no data-transmit station at the "no
+    /// station" marker, so addressing a broadcast frame to a real BC/MC station
+    /// is what lets a client's DHCP reply actually reach the air.  A station
+    /// with no access point sends everything through its one associated peer,
+    /// so the link supplies a fixed pair.
+    fn resolve_next_tx_indices(&self) -> Option<(u8, u8)> {
+        // The access point is checked first on purpose.  After a STA->AP switch
+        // a station peer can still be parked in `link`, and routing client
+        // frames through that stale uplink would silently deliver them to the
+        // old BSS and starve the DHCP reply.
+        if let Some(ap) = self.data.ap.as_ref() {
+            let dest = self.data.tx.front_destination()?;
+            return Some((
+                ap.interface_index,
+                ap.station_index_for(&dest).unwrap_or(ap.bcmc_index),
+            ));
+        }
+        self.data.link.tx_indices()
     }
 
     fn consume_eapol(&mut self, ethernet: &[u8]) -> Result<(), AicError> {
@@ -514,7 +700,12 @@ impl AicDevice {
             .link
             .mac_address()
             .ok_or(AicError::InvalidMacAddress)?;
-        let (_, bssid) = self.data.link.peer().ok_or(AicError::WpaProtocol)?;
+        let (station_index, bssid) = self.data.link.peer().ok_or(AicError::WpaProtocol)?;
+        let interface_index = self
+            .data
+            .link
+            .interface_index()
+            .ok_or(AicError::WpaProtocol)?;
         let mut ethernet = Vec::with_capacity(ethernet_length);
         ethernet.extend_from_slice(&bssid);
         ethernet.extend_from_slice(&local_mac);
@@ -523,9 +714,117 @@ impl AicDevice {
         self.data.internal_tx_bytes += ethernet.len();
         self.data.internal_tx.push_back(super::owner::InternalTx {
             kind,
-            ethernet_frame: ethernet,
+            interface_index,
+            station_index,
+            frame: super::owner::InternalTxFrame::Ethernet(ethernet),
         });
         Ok(())
+    }
+
+    /// Queues a raw 802.11 management-frame response (authentication or
+    /// association) for transmission on the access-point interface.
+    fn queue_internal_mgmt(&mut self, interface_index: u8, raw_frame: Vec<u8>) {
+        if self.data.internal_tx.len() >= INTERNAL_TX_CAPACITY
+            || self.data.internal_tx_bytes.saturating_add(raw_frame.len())
+                > INTERNAL_TX_BYTE_CAPACITY
+        {
+            return;
+        }
+        self.data.internal_tx_bytes += raw_frame.len();
+        self.data.internal_tx.push_back(super::owner::InternalTx {
+            kind: super::owner::InternalTxKind::ApMgmt,
+            interface_index,
+            station_index: u8::MAX,
+            frame: super::owner::InternalTxFrame::Mgmt(raw_frame),
+        });
+    }
+
+    /// Answers an access-point authentication or association request that the
+    /// firmware forwarded to us.  Only frames addressed to this AP's own MAC
+    /// are answered, so unrelated management traffic stays untouched.
+    fn maybe_respond_ap_mgmt(&mut self, frame: &[u8], subtype: u16) {
+        let (Some(our_mac), Some(interface_index)) = (
+            self.data.link.mac_address(),
+            self.data.ap.as_ref().map(|ap| ap.interface_index),
+        ) else {
+            return;
+        };
+        if frame.get(4..10) != Some(&our_mac[..]) {
+            return;
+        }
+        let src = frame.get(10..16).unwrap_or(&[]);
+        let aid = match subtype {
+            11 => None,
+            0 => Some(
+                self.data
+                    .ap
+                    .as_mut()
+                    .map(|ap| ap.next_aid())
+                    .unwrap_or_default(),
+            ),
+            _ => return,
+        };
+        let response = match (subtype, aid) {
+            (11, _) => crate::ap::auth_response(frame),
+            (0, Some(aid)) => crate::ap::assoc_response(frame, aid),
+            _ => None,
+        };
+        match response {
+            Some(raw_frame) => {
+                log::info!(
+                    "[wifi] ap queued {} resp src={src:02x?} if={interface_index} len={}",
+                    if subtype == 11 { "AUTH" } else { "ASSOC" },
+                    raw_frame.len(),
+                );
+                self.queue_internal_mgmt(interface_index, raw_frame);
+                if let Some(aid) = aid {
+                    self.queue_ap_station_add(frame, aid, interface_index);
+                }
+            }
+            None if matches!(subtype, 0 | 11) => {
+                log::info!(
+                    "[wifi] ap skipped {} resp build src={src:02x?}",
+                    if subtype == 11 { "AUTH" } else { "ASSOC" },
+                );
+            }
+            None => {}
+        }
+    }
+
+    /// Registers a freshly associated client with the firmware by queueing an
+    /// `ME_STA_ADD` on the control mailbox, mirroring the vendor's
+    /// `add_station` step that hostapd performs after sending the association
+    /// response.  It is never submitted directly from this receive callback:
+    /// it is placed on `lifecycle.control.commands`, which the owner drains
+    /// through the mailbox state machine.  While a user control operation owns
+    /// the control state the registration is skipped; the client retransmits
+    /// its association and is picked up once the queue frees.
+    fn queue_ap_station_add(&mut self, request: &[u8], aid: u16, interface_index: u8) {
+        let Some(peer): Option<[u8; 6]> = request
+            .get(10..16)
+            .map(|mac| mac.try_into().expect("six-byte slice converts to array"))
+        else {
+            return;
+        };
+        let rates = crate::ap::assoc_supported_rates(request);
+        let command = super::control::ap_sta_add_command(peer, &rates, aid, interface_index);
+        if let Some(control) = self.lifecycle.control.as_mut() {
+            if !control.is_ap_station_add() {
+                return;
+            }
+            if control.push_station_add(command).is_err() {
+                return;
+            }
+        } else {
+            self.lifecycle.control = Some(super::control::ControlState::ap_station_add(command));
+        }
+        if let Some(ap) = self.data.ap.as_mut() {
+            ap.queue_station_add(peer);
+        }
+        log::info!(
+            "[wifi] ap queued ME_STA_ADD peer={peer:02x?} aid={aid} rates={}",
+            rates.len(),
+        );
     }
 }
 
@@ -876,6 +1175,24 @@ mod tests {
     }
 
     #[test]
+    fn idle_access_point_parks_on_a_timed_receive_poll() {
+        use crate::device::owner::ApState;
+        let mut device = AicDevice::new(ChipVariant::Aic8800DC).unwrap();
+        device.lifecycle.state = AicState::Ready;
+        device.data.ap = Some(ApState::new(3));
+
+        let now = MonotonicTime::from_nanos(1_000_000);
+        let AicAction::WaitForInterruptUntil(deadline) = device.drive_ready(now) else {
+            panic!("an idle access point must wake on a timer, not a bare interrupt");
+        };
+        // One bounded scan is armed for the next wake and the owner parks on
+        // the poll deadline, releasing the lock instead of rescanning in a
+        // tight loop that would starve control submissions.
+        assert!(device.io.receive.active);
+        assert!(deadline.as_nanos() > now.as_nanos());
+    }
+
+    #[test]
     fn transmit_completion_precedes_a_receive_backlog() {
         let mut device = AicDevice::new(ChipVariant::Aic8800DC).unwrap();
         device.lifecycle.state = AicState::Ready;
@@ -929,6 +1246,209 @@ mod tests {
         assert_eq!(decapsulate_data_frames(&management, 0), None);
     }
 
+    fn mgmt_header(frame_control: u16, dst: [u8; 6], src: [u8; 6]) -> Vec<u8> {
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&frame_control.to_le_bytes());
+        frame.extend_from_slice(&[0, 0]); // duration
+        frame.extend_from_slice(&dst);
+        frame.extend_from_slice(&src);
+        frame.extend_from_slice(&dst); // addr3 = BSS
+        frame.extend_from_slice(&[0, 0]); // sequence control
+        frame
+    }
+
+    #[test]
+    fn ap_answers_authentication_and_association_without_a_peer() {
+        use crate::{
+            ap,
+            device::owner::{ApState, InternalTxFrame},
+        };
+
+        let our_mac = [0x50, 0x31, 0x23, 0x23, 0x22, 0xf8];
+        let client = [0x7c, 0x50, 0x79, 0x36, 0xf0, 0x15];
+        let mut device = AicDevice::new(ChipVariant::Aic8800D80).unwrap();
+        device.lifecycle.state = AicState::Ready;
+        device.data.link.install_mac(our_mac).unwrap();
+        device.data.ap = Some(ApState::new(3));
+        // An access point never installs a station peer, so the transmit path
+        // cannot resolve firmware indices through `tx_indices`.
+        assert!(device.data.link.tx_indices().is_none());
+
+        let mut auth = mgmt_header(0x00b0, our_mac, client);
+        auth.extend_from_slice(&[0, 0, 1, 0, 0, 0]); // algorithm, transaction 1, status
+        device.maybe_respond_ap_mgmt(&auth, 11);
+        let response = device
+            .data
+            .internal_tx
+            .pop_front()
+            .expect("authentication request is answered");
+        assert_eq!(response.interface_index, 3);
+        assert!(matches!(
+            response.frame,
+            InternalTxFrame::Mgmt(frame)
+                if frame == ap::auth_response(&auth).expect("valid request")
+        ));
+
+        // A request that is not addressed to this access point stays ignored.
+        device.maybe_respond_ap_mgmt(&mgmt_header(0x00b0, [0; 6], client), 11);
+        assert!(device.data.internal_tx.is_empty());
+
+        let mut assoc = mgmt_header(0x0000, our_mac, client);
+        assoc.extend_from_slice(&[0x21, 0x00, 0, 0]); // capability + listen interval
+        device.maybe_respond_ap_mgmt(&assoc, 0);
+        let response = device
+            .data
+            .internal_tx
+            .pop_front()
+            .expect("association request is answered");
+        assert!(matches!(
+            response.frame,
+            InternalTxFrame::Mgmt(frame)
+                if frame == ap::assoc_response(&assoc, 1).expect("valid request")
+        ));
+
+        // A management response must be transmitted even though no station
+        // peer is associated, proving the AP transmit path bypasses
+        // `tx_indices`.
+        device.maybe_respond_ap_mgmt(&auth, 11);
+        device.prepare_next_transmit();
+        assert!(device.data.active_tx.is_some());
+    }
+
+    #[test]
+    fn ap_association_queues_a_station_add_command_for_the_peer() {
+        use crate::{
+            device::owner::ApState,
+            lmac::{ME_STA_ADD_REQ, TASK_ME},
+        };
+
+        let our_mac = [0x50, 0x31, 0x23, 0x23, 0x22, 0xf8];
+        let client = [0x7c, 0x50, 0x79, 0x36, 0xf0, 0x15];
+        let mut device = AicDevice::new(ChipVariant::Aic8800D80).unwrap();
+        device.lifecycle.state = AicState::Ready;
+        device.data.link.install_mac(our_mac).unwrap();
+        device.data.ap = Some(ApState::new(3));
+
+        let mut assoc = mgmt_header(0x0000, our_mac, client);
+        assoc.extend_from_slice(&[0x21, 0x00, 0, 0]); // capability + listen interval
+        assoc.extend_from_slice(&[1, 4, 0x82, 0x84, 0x8b, 0x96]); // supported rates
+        device.maybe_respond_ap_mgmt(&assoc, 0);
+
+        // The association response is still emitted as a management frame, and
+        // registering the peer is queued on the control mailbox rather than
+        // submitted straight from this receive callback.
+        assert!(device.data.internal_tx.front().is_some());
+        let control = device
+            .lifecycle
+            .control
+            .as_ref()
+            .expect("association opens a station-add control state");
+        assert!(control.is_ap_station_add());
+        let command = control.commands.front().expect("one queued command");
+        assert_eq!(command.message_id, ME_STA_ADD_REQ);
+        assert_eq!(command.destination, TASK_ME);
+        let payload = &command.payload;
+        assert_eq!(&payload[0..6], &client);
+        assert_eq!(payload[6], 4); // supported-rate count
+        assert_eq!(&payload[7..11], &[0x82, 0x84, 0x8b, 0x96]);
+        assert_eq!(&payload[124..126], &1u16.to_le_bytes()); // allocated aid
+        assert_eq!(payload[129], 3); // AP interface index
+
+        // The peer is tracked so the pending confirmation can be attributed,
+        // and its firmware station index becomes resolvable for transmit.
+        let ap = device.data.ap.as_mut().unwrap();
+        assert_eq!(ap.complete_station_add(5), Some(client));
+        assert_eq!(ap.station_index_for(&client), Some(5));
+        assert_eq!(ap.station_index_for(&[0, 0, 0, 0, 0, 0]), None);
+    }
+
+    #[test]
+    fn ap_addresses_host_frames_to_the_registered_station() {
+        use crate::device::owner::ApState;
+
+        let ap_mac = [0x50, 0x31, 0x23, 0x23, 0x22, 0xf8];
+        let client = [0x7c, 0x50, 0x79, 0x36, 0xf0, 0x15];
+
+        let mut device = AicDevice::new(ChipVariant::Aic8800D80).unwrap();
+        device.lifecycle.state = AicState::Ready;
+        device.data.link.install_mac(ap_mac).unwrap();
+        let mut ap = ApState::new(3);
+        ap.queue_station_add(client);
+        assert_eq!(ap.complete_station_add(5), Some(client));
+        device.data.ap = Some(ap);
+
+        // A unicast frame for the associated client is sent on the AP VIF with
+        // the firmware station index that client's `ME_STA_ADD` returned.
+        let mut ethernet = client.to_vec();
+        ethernet.extend_from_slice(&ap_mac);
+        ethernet.extend_from_slice(&[0x08, 0x00]); // IPv4
+        ethernet.extend_from_slice(&[0xab; 40]);
+        device.data.tx.enqueue(TxToken::new(1), ethernet).unwrap();
+        device.prepare_next_transmit();
+        let wire = &device.data.active_tx.as_ref().unwrap().wire_frame;
+        // `struct hostdesc` follows the 4-byte SDIO header: destination MAC at
+        // offset 8, interface index at 24, station index at 25.
+        assert_eq!(&wire[4 + 8..4 + 14], &client);
+        assert_eq!(wire[4 + 24], 3);
+        assert_eq!(wire[4 + 25], 5);
+
+        // A broadcast frame (an ARP request, or the DHCP reply to a client
+        // that has no address yet) has no single station.  It must go through
+        // the firmware BC/MC station returned by the AP start confirmation; the
+        // firmware has no data-transmit station at the "no station" marker, so
+        // falling back to that marker would drop the frame instead of sending
+        // it over the air.
+        let mut device = AicDevice::new(ChipVariant::Aic8800D80).unwrap();
+        device.lifecycle.state = AicState::Ready;
+        device.data.link.install_mac(ap_mac).unwrap();
+        let mut ap = ApState::new(3);
+        ap.set_bcmc(8);
+        device.data.ap = Some(ap);
+        let mut broadcast = [0xff; 6].to_vec();
+        broadcast.extend_from_slice(&ap_mac);
+        broadcast.extend_from_slice(&[0x08, 0x06]); // ARP
+        broadcast.extend_from_slice(&[0xab; 40]);
+        device.data.tx.enqueue(TxToken::new(2), broadcast).unwrap();
+        device.prepare_next_transmit();
+        let wire = &device.data.active_tx.as_ref().unwrap().wire_frame;
+        assert_eq!(wire[4 + 24], 3);
+        assert_eq!(wire[4 + 25], 8);
+    }
+
+    #[test]
+    fn ap_client_frames_ignore_a_stale_station_link() {
+        use crate::device::owner::ApState;
+
+        let ap_mac = [0x50, 0x31, 0x23, 0x23, 0x22, 0xf8];
+        let client = [0x7c, 0x50, 0x79, 0x36, 0xf0, 0x15];
+
+        let mut device = AicDevice::new(ChipVariant::Aic8800D80).unwrap();
+        device.lifecycle.state = AicState::Ready;
+        device.data.link.install_mac(ap_mac).unwrap();
+        // Simulate the STA->AP switch: the previous association is still
+        // parked in `link`, so `tx_indices()` would otherwise hijack the reply.
+        device.data.link.install_interface(1).unwrap();
+        device.data.link.install_peer(1, 7, ap_mac).unwrap();
+        assert_eq!(device.data.link.tx_indices(), Some((1, 7)));
+        let mut ap = ApState::new(3);
+        ap.queue_station_add(client);
+        assert_eq!(ap.complete_station_add(5), Some(client));
+        device.data.ap = Some(ap);
+
+        let mut ethernet = client.to_vec();
+        ethernet.extend_from_slice(&ap_mac);
+        ethernet.extend_from_slice(&[0x08, 0x00]); // IPv4
+        ethernet.extend_from_slice(&[0xab; 40]);
+        device.data.tx.enqueue(TxToken::new(1), ethernet).unwrap();
+        device.prepare_next_transmit();
+        let wire = &device.data.active_tx.as_ref().unwrap().wire_frame;
+        // The frame must go out on the AP VIF with the client's station index,
+        // never the stale station link (interface 1, station 7).
+        assert_eq!(&wire[4 + 8..4 + 14], &client);
+        assert_eq!(wire[4 + 24], 3);
+        assert_eq!(wire[4 + 25], 5);
+    }
+
     #[test]
     fn qos_data_mpdu_is_decapsulated_to_ethernet() {
         let frame = data_mpdu(0x0288, &[1, 2, 3]);
@@ -938,6 +1458,20 @@ mod tests {
             .expect("one MSDU");
         assert_eq!(&ethernet[..6], &[1, 2, 3, 4, 5, 6]);
         assert_eq!(&ethernet[6..12], &[0x21, 0x22, 0x23, 0x24, 0x25, 0x26]);
+        assert_eq!(&ethernet[12..], &[0x08, 0x00, 1, 2, 3]);
+    }
+
+    #[test]
+    fn client_to_ds_frame_decapsulates_for_the_access_point() {
+        // A client->access-point data MPDU sets ToDS only: the Ethernet
+        // destination is address 3 and the source is address 2 (the client).
+        let frame = data_mpdu(0x0188, &[1, 2, 3]);
+        let [ethernet] = decapsulate_data_frames(&frame, 0)
+            .expect("valid ToDS data")
+            .try_into()
+            .expect("one MSDU");
+        assert_eq!(&ethernet[..6], &[0x21, 0x22, 0x23, 0x24, 0x25, 0x26]); // addr3 = DA
+        assert_eq!(&ethernet[6..12], &[0x11, 0x12, 0x13, 0x14, 0x15, 0x16]); // addr2 = client
         assert_eq!(&ethernet[12..], &[0x08, 0x00, 1, 2, 3]);
     }
 

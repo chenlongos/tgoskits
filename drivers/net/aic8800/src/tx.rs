@@ -44,6 +44,16 @@ impl TxState {
         )
     }
 
+    /// Returns the destination MAC of the frame at the head of the queue, or
+    /// [`None`] when the queue is empty or its head is too short to carry one.
+    /// An access point uses this to resolve the per-destination station index
+    /// before it builds the frame, since it has no single associated peer.
+    pub(crate) fn front_destination(&self) -> Option<[u8; 6]> {
+        let frame = &self.queue.front()?.frame;
+        let dest: [u8; 6] = frame.get(..6)?.try_into().expect("six-byte slice converts");
+        Some(dest)
+    }
+
     pub(crate) fn drain_tokens(&mut self) -> impl Iterator<Item = TxToken> + '_ {
         self.queue.drain(..).map(|pending| pending.token)
     }

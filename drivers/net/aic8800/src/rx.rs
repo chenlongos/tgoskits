@@ -26,6 +26,7 @@ pub(crate) enum ParsedFrame {
     DataConfirmation,
     FirmwarePrint {
         length: usize,
+        content: Vec<u8>,
     },
     Confirmation {
         message_id: u16,
@@ -207,7 +208,15 @@ pub(crate) fn parse_fifo(
                 ));
             }
             if control_budget.admit(0) {
-                frames.push(ParsedFrame::FirmwarePrint { length: packet_len });
+                let print_start = offset + 4;
+                let print_end = print_start.saturating_add(packet_len);
+                frames.push(ParsedFrame::FirmwarePrint {
+                    length: packet_len,
+                    content: bytes
+                        .get(print_start..print_end.min(bytes.len()))
+                        .unwrap_or(&[])
+                        .to_vec(),
+                });
             }
             offset += aggregate_len;
         } else if packet_type == SDIO_TYPE_DATA {
@@ -325,7 +334,7 @@ mod tests {
 
         assert!(matches!(
             parse_fifo(&fifo, None).unwrap().as_slice(),
-            [ParsedFrame::FirmwarePrint { length: 8 }]
+            [ParsedFrame::FirmwarePrint { length: 8, .. }]
         ));
     }
 

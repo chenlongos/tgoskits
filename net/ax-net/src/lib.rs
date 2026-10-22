@@ -325,6 +325,16 @@ pub fn reconfigure_wifi(ifname: &str, mut transaction: WifiTransaction) -> NetRe
         }
         WifiOperation::StartOpenAccessPoint { .. } => {
             let policy = transaction.link_policy().ok_or(NetError::InvalidInput)?;
+            log::info!(
+                "[wifi] reconfiguring dev {} as AP {}/{}, DHCP client {}",
+                interface.device_index,
+                Ipv4Address::from(policy.ip),
+                policy.prefix_len,
+                policy
+                    .dhcp_server_client_ip
+                    .map(|ip| alloc::format!("{}", Ipv4Address::from(ip)))
+                    .unwrap_or_else(|| "none".into())
+            );
             service.reconfigure_as_ap(
                 interface.device_index,
                 Ipv4Address::from(policy.ip),
@@ -452,7 +462,7 @@ pub fn init_network(
             );
             wifi_interfaces.push(WifiInterfaceControl {
                 ifname: name.clone(),
-                device_index: order,
+                device_index: eth_dev,
                 mac,
                 handle,
             });
@@ -486,7 +496,7 @@ pub fn init_network(
             && let Some(client_ip) = policy.dhcp_server_client_ip
         {
             wifi_dhcp_servers.push((
-                order,
+                eth_dev,
                 Ipv4Address::from(policy.ip),
                 Ipv4Address::from(client_ip),
                 mask_from_prefix(policy.prefix_len),

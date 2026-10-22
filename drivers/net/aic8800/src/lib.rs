@@ -8,6 +8,7 @@
 
 extern crate alloc;
 
+mod ap;
 pub mod common;
 mod device;
 mod firmware;

@@ -116,6 +116,7 @@ impl AicDevice {
                 self.lifecycle.cancel_pending = false;
                 self.data.link.clear_peer();
                 self.data.clear_internal_tx();
+                self.data.ap = None;
                 Ok(())
             }
             operation => {
@@ -207,6 +208,7 @@ impl AicDevice {
         self.lifecycle.control = None;
         self.data.link.clear_peer();
         self.data.clear_internal_tx();
+        self.data.ap = None;
         if self.lifecycle.state == AicState::Starting {
             self.lifecycle.startup = None;
             self.lifecycle.state = AicState::Stopped;
@@ -227,6 +229,7 @@ impl AicDevice {
             let _ = self.data.push_event(AicEvent::TransmitComplete(token));
         }
         self.data.clear_internal_tx();
+        self.data.ap = None;
         let tokens: Vec<_> = self.data.tx.drain_tokens().collect();
         for token in tokens {
             let _ = self.data.push_event(AicEvent::TransmitComplete(token));

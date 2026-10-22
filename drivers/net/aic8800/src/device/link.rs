@@ -120,6 +120,11 @@ impl LinkState {
         self.peer = None;
         self.control_port_open = false;
     }
+
+    pub(super) fn clear_interface(&mut self) {
+        self.interface = None;
+        self.clear_peer();
+    }
 }
 
 #[cfg(test)]

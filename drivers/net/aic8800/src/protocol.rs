@@ -19,6 +19,15 @@ const HOST_DESCRIPTOR_SIZE: usize = 28;
 const TX_ALIGNMENT: usize = 4;
 const TAIL_SIZE: usize = 4;
 const DEBUG_BLOCK_DATA_SIZE: usize = 1024;
+/// `TXU_CNTRL_MGMT` in the vendor `struct hostdesc.flags` word: it tells the
+/// firmware that the payload is a raw 802.11 frame to transmit verbatim
+/// rather than an Ethernet body to encapsulate.
+const TX_FLAG_MGMT: u16 = 1 << 3;
+/// Vendor `rwnx_tx_mgmt` stamps the management descriptor with a broadcast
+/// Ethernet destination and `tid = 0xFF` (the peer is not yet known to the
+/// firmware); the real recipient lives in the raw 802.11 address fields.
+const MGMT_ETH_DEST: [u8; 6] = [0xff; 6];
+const MGMT_TID: u8 = 0xff;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DebugConfirmationError {
@@ -163,7 +172,67 @@ pub(crate) fn ethernet_tx_frame(
     // FULLMAC carries the Ethernet addresses and EtherType in `hostdesc`.
     // Match vendor `rwnx_tx.c`: save those fields, pull the 14-byte Ethernet
     // header, then submit only the remaining L3 payload after the descriptor.
-    let payload = &ethernet[14..];
+    let dest: [u8; 6] = ethernet[..6].try_into().expect("length checked above");
+    let src: [u8; 6] = ethernet[6..12].try_into().expect("length checked above");
+    let ethertype: [u8; 2] = ethernet[12..14].try_into().expect("length checked above");
+    Ok(build_tx_frame(
+        &ethernet[14..],
+        HostTx {
+            dest,
+            src,
+            ethertype,
+            interface_index,
+            station_index,
+            tid: 0,
+            flags: 0,
+        },
+        v3,
+    ))
+}
+
+/// Submits one raw 802.11 management frame (an authentication or association
+/// response) for transmission on the access-point interface.  Mirrors the
+/// vendor `rwnx_tx_mgmt` path: the frame is placed after the host descriptor
+/// untouched, the station is unknown, and `TXU_CNTRL_MGMT` stops the firmware
+/// from applying its Ethernet encapsulation.
+pub(crate) fn mgmt_tx_frame(
+    raw_frame: &[u8],
+    interface_index: u8,
+    v3: bool,
+) -> Result<Vec<u8>, ()> {
+    if raw_frame.len() < 16 {
+        return Err(());
+    }
+    let src: [u8; 6] = raw_frame[10..16].try_into().expect("length checked above");
+    Ok(build_tx_frame(
+        raw_frame,
+        HostTx {
+            dest: MGMT_ETH_DEST,
+            src,
+            ethertype: [0, 0],
+            interface_index,
+            station_index: u8::MAX,
+            tid: MGMT_TID,
+            flags: TX_FLAG_MGMT,
+        },
+        v3,
+    ))
+}
+
+/// Host-descriptor fields shared by the data and management transmit paths.
+struct HostTx {
+    dest: [u8; 6],
+    src: [u8; 6],
+    ethertype: [u8; 2],
+    interface_index: u8,
+    station_index: u8,
+    tid: u8,
+    flags: u16,
+}
+
+/// Assembles the SDIO block, the 28-byte vendor `struct hostdesc`, and the
+/// payload shared by the data and management transmit paths.
+fn build_tx_frame(payload: &[u8], host: HostTx, v3: bool) -> Vec<u8> {
     let raw_len = SDIO_HEADER_SIZE + HOST_DESCRIPTOR_SIZE + payload.len();
     let aligned = align_up(raw_len, TX_ALIGNMENT);
     let final_len = if aligned.is_multiple_of(BLOCK_SIZE) {
@@ -187,15 +256,17 @@ pub(crate) fn ethernet_tx_frame(
     let descriptor = &mut frame[SDIO_HEADER_SIZE..SDIO_HEADER_SIZE + HOST_DESCRIPTOR_SIZE];
     descriptor[..2].copy_from_slice(&(payload.len() as u16).to_le_bytes());
     descriptor[4..8].copy_from_slice(&0x8000_0001u32.to_le_bytes());
-    descriptor[8..14].copy_from_slice(&ethernet[..6]);
-    descriptor[14..20].copy_from_slice(&ethernet[6..12]);
-    descriptor[20..22].copy_from_slice(&ethernet[12..14]);
-    descriptor[24] = interface_index;
-    descriptor[25] = station_index;
+    descriptor[8..14].copy_from_slice(&host.dest);
+    descriptor[14..20].copy_from_slice(&host.src);
+    descriptor[20..22].copy_from_slice(&host.ethertype);
+    descriptor[24] = host.interface_index;
+    descriptor[25] = host.station_index;
+    descriptor[23] = host.tid;
+    descriptor[26..28].copy_from_slice(&host.flags.to_le_bytes());
     frame[SDIO_HEADER_SIZE + HOST_DESCRIPTOR_SIZE
         ..SDIO_HEADER_SIZE + HOST_DESCRIPTOR_SIZE + payload.len()]
         .copy_from_slice(payload);
-    Ok(frame)
+    frame
 }
 
 #[cfg(test)]
@@ -274,5 +345,33 @@ mod tests {
         assert_eq!(u16::from_le_bytes([dc_frame[0], dc_frame[1]]), 32);
         assert_eq!(dc_frame[2], 0x01);
         assert_eq!(dc_frame[3], 0);
+    }
+
+    #[test]
+    fn mgmt_tx_marks_the_descriptor_raw_and_keeps_the_80211_frame() {
+        let mut raw = vec![0xb0, 0x00, 0x00, 0x00];
+        raw.extend_from_slice(&[0x10; 6]); // addr1 = client
+        raw.extend_from_slice(&[0x20; 6]); // addr2 = AP
+        raw.extend_from_slice(&[0x20; 6]); // addr3 = AP
+        raw.extend_from_slice(&[0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00]);
+
+        let frame = mgmt_tx_frame(&raw, 2, true).unwrap();
+        let descriptor = &frame[SDIO_HEADER_SIZE..SDIO_HEADER_SIZE + HOST_DESCRIPTOR_SIZE];
+        assert_eq!(&descriptor[..2], &(raw.len() as u16).to_le_bytes());
+        assert_eq!(&descriptor[8..14], &[0xff; 6]);
+        assert_eq!(&descriptor[14..20], &[0x20; 6]);
+        assert_eq!(descriptor[23], MGMT_TID);
+        assert_eq!(descriptor[24], 2);
+        assert_eq!(descriptor[25], u8::MAX);
+        assert_eq!(&descriptor[26..28], &TX_FLAG_MGMT.to_le_bytes());
+        assert_eq!(
+            &frame[SDIO_HEADER_SIZE + HOST_DESCRIPTOR_SIZE..][..raw.len()],
+            &raw
+        );
+    }
+
+    #[test]
+    fn mgmt_tx_rejects_a_frame_without_two_addresses() {
+        assert!(mgmt_tx_frame(&[0xb0, 0x00, 0, 0, 0, 0, 0, 0, 0], 2, true).is_err());
     }
 }

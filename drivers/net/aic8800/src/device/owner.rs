@@ -21,6 +21,7 @@ pub(super) struct ActiveTx {
 pub(super) enum InternalTxKind {
     M2,
     M4,
+    ApMgmt,
 }
 
 pub(super) enum TxCompletion {
@@ -28,9 +29,111 @@ pub(super) enum TxCompletion {
     Internal(InternalTxKind),
 }
 
+/// A host-originated frame queued behind the network stack's own traffic.
+/// Each entry carries the firmware indices it must be sent with, so access-
+/// point management responses can use the AP VIF while station frames use the
+/// associated peer, without the transmit path inspecting the link state.
+pub(super) enum InternalTxFrame {
+    /// Ethernet body that the firmware encapsulates into 802.11 data.
+    Ethernet(Vec<u8>),
+    /// Raw 802.11 management frame transmitted verbatim on an access point.
+    Mgmt(Vec<u8>),
+}
+
+impl InternalTxFrame {
+    fn len(&self) -> usize {
+        match self {
+            Self::Ethernet(frame) | Self::Mgmt(frame) => frame.len(),
+        }
+    }
+}
+
 pub(super) struct InternalTx {
     pub kind: InternalTxKind,
-    pub ethernet_frame: Vec<u8>,
+    pub interface_index: u8,
+    pub station_index: u8,
+    pub frame: InternalTxFrame,
+}
+
+/// Identity of a running open access point: the firmware VIF its management
+/// responses must be sent on, the next association identifier to hand to
+/// a client, the clients whose `ME_STA_ADD` confirmation is still pending, and
+/// the firmware station index each associated client was given.
+pub(super) struct ApState {
+    pub interface_index: u8,
+    /// Firmware station index that carries broadcast and multicast traffic on
+    /// this access-point VIF, returned in the `APM_START_CFM` (`bcmc_idx`).  A
+    /// client's unicast frame uses that client's own station, but a broadcast
+    /// frame (the DHCP reply to a client that has no address yet) must use this
+    /// BC/MC station: the firmware has no data-transmit station at the "no
+    /// station" marker, so leaving it unset drops the frame instead of sending
+    /// it over the air.  It becomes valid once the access point starts.
+    pub bcmc_index: u8,
+    next_aid: u16,
+    /// Peers submitted for firmware registration, in command order, so each
+    /// `ME_STA_ADD` confirmation's station index can be matched to its MAC.
+    pending_station_add: VecDeque<[u8; 6]>,
+    /// Firmware station index per associated client MAC.  A station transmits
+    /// through the single peer the link tracks, but an access point has no
+    /// such peer: it must address each host frame to the station the firmware
+    /// assigned to that frame's destination.
+    stations: Vec<([u8; 6], u8)>,
+}
+
+impl ApState {
+    pub(super) fn new(interface_index: u8) -> Self {
+        Self {
+            interface_index,
+            bcmc_index: u8::MAX,
+            next_aid: 1,
+            pending_station_add: VecDeque::new(),
+            stations: Vec::new(),
+        }
+    }
+
+    /// Records the firmware BC/MC station index from the start confirmation so
+    /// broadcast client frames can be addressed to a station that exists.
+    pub(super) fn set_bcmc(&mut self, bcmc_index: u8) {
+        self.bcmc_index = bcmc_index;
+    }
+
+    /// Allocates the next association identifier in the `1..=2007` range
+    /// 802.11 defines, wrapping so a long-lived AP reuses identifiers once
+    /// clients have left.
+    pub(super) fn next_aid(&mut self) -> u16 {
+        let aid = self.next_aid;
+        self.next_aid = if aid >= 2007 { 1 } else { aid + 1 };
+        aid
+    }
+
+    /// Records that a `ME_STA_ADD` for `peer` has been queued so its pending
+    /// confirmation can be attributed back to this client.
+    pub(super) fn queue_station_add(&mut self, peer: [u8; 6]) {
+        self.pending_station_add.push_back(peer);
+    }
+
+    /// Consumes the oldest pending registration when its confirmation arrives,
+    /// recording the firmware station index against the peer it belongs to.
+    /// A client that re-associates refreshes its index instead of adding a
+    /// duplicate entry, so the table holds one row per MAC.
+    pub(super) fn complete_station_add(&mut self, station_index: u8) -> Option<[u8; 6]> {
+        let peer = self.pending_station_add.pop_front()?;
+        match self.stations.iter_mut().find(|(mac, _)| *mac == peer) {
+            Some(entry) => entry.1 = station_index,
+            None => self.stations.push((peer, station_index)),
+        }
+        Some(peer)
+    }
+
+    /// Resolves the firmware station index a host frame destined for `dest`
+    /// must be transmitted with, or [`None`] when the destination is not an
+    /// associated client (a broadcast or an unknown peer).
+    pub(super) fn station_index_for(&self, dest: &[u8; 6]) -> Option<u8> {
+        self.stations
+            .iter()
+            .find(|(mac, _)| mac == dest)
+            .map(|(_, index)| *index)
+    }
 }
 
 pub(super) struct LifecycleState {
@@ -64,6 +167,7 @@ pub(super) struct DataPlaneState {
     pub internal_tx: VecDeque<InternalTx>,
     pub internal_tx_bytes: usize,
     pub link: LinkState,
+    pub ap: Option<ApState>,
 }
 
 impl DataPlaneState {
@@ -116,7 +220,7 @@ impl DataPlaneState {
 
     pub(super) fn pop_internal_tx(&mut self) -> Option<InternalTx> {
         let internal = self.internal_tx.pop_front()?;
-        self.internal_tx_bytes -= internal.ethernet_frame.len();
+        self.internal_tx_bytes -= internal.frame.len();
         Some(internal)
     }
 
@@ -179,6 +283,7 @@ impl AicDevice {
                 internal_tx: VecDeque::new(),
                 internal_tx_bytes: 0,
                 link: LinkState::new(),
+                ap: None,
             },
         })
     }
