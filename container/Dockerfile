@@ -6,6 +6,7 @@ ARG QEMU_VERSION=11.1.1
 ENV TZ=Etc/UTC \
     RUSTUP_HOME=/opt/rustup \
     CARGO_HOME=/opt/cargo \
+    LIBCLANG_PATH=/usr/lib/llvm-19/lib \
     PATH=/opt/cargo/bin:/opt/qemu-${QEMU_VERSION}/bin:/opt/x86_64-linux-musl-cross/bin:/opt/aarch64-linux-musl-cross/bin:/opt/riscv64-linux-musl-cross/bin:/opt/loongarch64-linux-musl-cross/bin:${PATH}
 
 RUN apt-get update \
