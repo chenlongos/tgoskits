@@ -54,6 +54,9 @@ fn iomap_usize(paddr: usize, size: usize) -> usize {
 const CAMERA_FORMAT_MJPEG: u8 = 1;
 const MIN_VALID_JPEG_BYTES: usize = 4096;
 const MAX_CAPTURE_TRIES: u32 = 8;
+/// 连续多少次抓帧失败后就放弃原地重启视频流,改为丢弃会话让下次 ioctl
+/// 重新枚举设备。原地重启只解决控制器/通道状态卡死,救不回真掉线的设备。
+const MAX_STREAM_RESTARTS: u32 = 3;
 /// Default resolution cap (640×480 = 307200 pixels) guiding UVC frame selection.
 const DEFAULT_RESOLUTION: u32 = 640 * 480;
 
@@ -81,6 +84,8 @@ struct UsbCameraSession {
 struct UsbCameraState {
     session: Option<UsbCameraSession>,
     smallcore: Option<SmallCoreSource>,
+    /// 连续抓帧失败次数:成功抓帧或丢弃会话后归零。
+    stream_restarts: u32,
 }
 
 // ---- 小核帧源(2026-09-27 分核架构)----
@@ -248,7 +253,6 @@ impl SmallCoreSource {
 
     /// 等下一帧(帧计数推进),从槽区拷入内核静态缓冲。
     #[allow(dead_code)]
-    #[allow(dead_code)]
     fn frame(&mut self) -> Option<&'static [u8]> {
         let deadline = ax_runtime::hal::time::wall_time() + Duration::from_secs(3);
         let mut dbg_count = 0u32;
@@ -260,7 +264,7 @@ impl SmallCoreSource {
             if dbg_count == 1 {
                 info!("FRAME-LOOP fc={:#x} last={:#x}", fc, self.last_fc);
             }
-            if dbg_count % 1000000 == 0 {
+            if dbg_count.is_multiple_of(1_000_000) {
                 info!("cvi-camera: frame() spin #{} fc={}", dbg_count, fc);
             }
             if fc != self.last_fc {
@@ -516,6 +520,68 @@ fn capture_frame(session: &UsbCameraSession) -> StarryResult<&'static [u8]> {
     Err(StarryError::Io)
 }
 
+/// 抓帧失败后的恢复:先分辨是设备掉线还是控制器/通道卡死。
+///
+/// 返回 `true` = 会话已原地重启、可以继续缓存;`false` = 调用方必须丢弃会话,
+/// 由下一次 ioctl 的 `ensure_initialized()` 重新枚举设备。
+fn recover_capture_failure(session: &mut UsbCameraSession, restarts: &mut u32) -> bool {
+    let dev = u32::from(session.cam.addr);
+    let ep0 = session.cam.ep0_mps;
+    let vs_if = session.sel.vs_interface;
+
+    if !root_usb_device_connected() {
+        warn!(
+            "cvi-camera: capture failed with USB device gone; dropping session, next ioctl \
+             re-enumerates"
+        );
+        return false;
+    }
+
+    *restarts += 1;
+    if *restarts > MAX_STREAM_RESTARTS {
+        warn!(
+            "cvi-camera: {} consecutive capture failures with USB device present; dropping \
+             session, next ioctl re-enumerates",
+            *restarts
+        );
+        return false;
+    }
+
+    warn!(
+        "cvi-camera: restarting UVC stream in place after capture failure ({}/{})",
+        *restarts, MAX_STREAM_RESTARTS
+    );
+    if let Err(error) = uvc::uvc_stop_streaming(dev, ep0, vs_if) {
+        warn!(
+            "cvi-camera: uvc_stop_streaming failed: {error:?}; dropping session, next ioctl \
+             re-enumerates"
+        );
+        return false;
+    }
+    // SET_INTERFACE(alt=0) 不会清抓帧连续性,必须显式复位 FID 跟踪,
+    // 否则重启后第一帧会被当成上一帧的尾巴继续拼。
+    uvc::reset_frame_continuity();
+    match uvc::uvc_start_video_stream(dev, ep0, &mut session.sel) {
+        Ok(()) => {
+            info!(
+                "cvi-camera: UVC stream restarted {}x{} payload={} frame_size={}",
+                session.sel.frame_w,
+                session.sel.frame_h,
+                session.sel.negotiated_payload_size,
+                session.sel.negotiated_frame_size
+            );
+            true
+        }
+        Err(error) => {
+            warn!(
+                "cvi-camera: uvc_start_video_stream failed: {error:?}; dropping session, next \
+                 ioctl re-enumerates"
+            );
+            false
+        }
+    }
+}
+
 impl UsbCameraState {
     fn ensure_initialized(&mut self) -> StarryResult<()> {
         if self.session.is_none() {
@@ -551,7 +617,22 @@ impl UsbCameraState {
 
     fn frame(&mut self) -> StarryResult<&'static [u8]> {
         self.ensure_initialized()?;
-        capture_frame(self.session.as_ref().ok_or(StarryError::NoSuchDevice)?)
+        let session = self.session.as_mut().ok_or(StarryError::NoSuchDevice)?;
+        match capture_frame(session) {
+            Ok(jpeg) => {
+                self.stream_restarts = 0;
+                Ok(jpeg)
+            }
+            Err(error) => {
+                // 报错已经由 capture_frame 打过;这里只负责别让缓存的会话
+                // 永久卡死:救得回来就留,救不回来就清掉触发重新枚举。
+                if !recover_capture_failure(session, &mut self.stream_restarts) {
+                    self.session = None;
+                    self.stream_restarts = 0;
+                }
+                Err(error)
+            }
+        }
     }
 }
 

@@ -19,7 +19,7 @@ use super::{
     },
     header::{JpegHeaderInfo, parse_jpeg_header},
     layout::{FrameLayout, FrameLayoutError, JpuPixelFormat, JpuScale, PlaneLayout},
-    regs::hardware_init_at,
+    regs::{hardware_init_at, wait_bbc_idle_at},
 };
 
 const DMA_ALIGNMENT: usize = 16 * 1024;
@@ -94,13 +94,45 @@ enum OutputFormat {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PollDisposition {
     Complete,
-    Quarantine(PollError),
+    /// The engine reached a terminal failure; the decoder resets it before reuse.
+    Recover(PollError),
 }
 
 const fn poll_disposition(result: Result<(), PollError>) -> PollDisposition {
     match result {
         Ok(()) => PollDisposition::Complete,
-        Err(error) => PollDisposition::Quarantine(error),
+        Err(error) => PollDisposition::Recover(error),
+    }
+}
+
+/// How many recent JPEG sizes are kept for failure diagnostics.
+const JPEG_LEN_HISTORY: usize = 4;
+
+/// Sizes of the most recently submitted JPEGs, oldest first.
+///
+/// A decode that stalls hundreds of frames into a stream reports the stalled
+/// frame's length together with this window: a frame much shorter than its
+/// neighbours points at truncated input rather than a decoder-side fault.
+#[derive(Default)]
+struct JpegLenHistory {
+    lengths: [u32; JPEG_LEN_HISTORY],
+    len: usize,
+}
+
+impl JpegLenHistory {
+    fn record(&mut self, jpeg_len: usize) {
+        let jpeg_len = u32::try_from(jpeg_len).unwrap_or(u32::MAX);
+        if self.len < JPEG_LEN_HISTORY {
+            self.lengths[self.len] = jpeg_len;
+            self.len += 1;
+        } else {
+            self.lengths.rotate_left(1);
+            self.lengths[JPEG_LEN_HISTORY - 1] = jpeg_len;
+        }
+    }
+
+    fn entries(&self) -> &[u32] {
+        &self.lengths[..self.len]
     }
 }
 
@@ -145,6 +177,7 @@ pub struct JpuDecoder {
     stream_buffer: Option<CpuDmaBuffer>,
     frame_buffer: Option<CpuDmaBuffer>,
     completed_frame_len: Option<usize>,
+    jpeg_len_history: JpegLenHistory,
     poisoned: bool,
 }
 
@@ -175,6 +208,7 @@ impl JpuDecoder {
             stream_buffer: None,
             frame_buffer: None,
             completed_frame_len: None,
+            jpeg_len_history: JpegLenHistory::default(),
             poisoned: false,
         })
     }
@@ -190,8 +224,9 @@ impl JpuDecoder {
     ///
     /// Returns a typed error for invalid JPEG data, unsupported layouts, DMA
     /// allocation/address failures, hardware decode errors, and timeouts. A
-    /// hardware decode error or timeout poisons the decoder because DMA
-    /// quiescence is not proven; subsequent calls return
+    /// hardware decode error or timeout resets the JPU and reuses its DMA
+    /// buffers when that reset completes; only a failed reset poisons the
+    /// decoder, after which subsequent calls return
     /// [`JpuDecodeError::Poisoned`].
     pub fn decode_scaled<'a>(
         &'a mut self,
@@ -232,8 +267,10 @@ impl JpuDecoder {
             OutputFormat::Yuv420 => layout.yuv420_layout()?,
         };
         let format = layout.format;
+        self.jpeg_len_history.record(jpeg_data.len());
         self.completed_frame_len = None;
         let stream_len = required_stream_capacity(jpeg_data.len(), header.ecs_offset)?;
+        let stream_end = declared_stream_end(jpeg_data.len())?;
         validate_dma_allocation_len(stream_len)?;
         validate_dma_allocation_len(layout.total_len)?;
         self.ensure_buffers(stream_len, layout.total_len)?;
@@ -241,7 +278,7 @@ impl JpuDecoder {
 
         let stream_dma = self.stream_dma_region(stream_len)?;
         let frame_dma = self.frame_dma_region(layout.total_len)?;
-        let stream_data_end = checked_dma_offset(stream_dma, jpeg_data.len(), true)?;
+        let stream_data_end = checked_dma_offset(stream_dma, stream_end, true)?;
         let frame_planes = checked_frame_dma_addresses(frame_dma, &layout)?;
         let hardware = HardwareDecodeInfo::for_format(format);
 
@@ -249,7 +286,7 @@ impl JpuDecoder {
             self.mmio.jpu_base,
             stream_dma,
             stream_data_end,
-            jpeg_data.len(),
+            stream_end,
             &header,
             &layout,
             hardware,
@@ -259,8 +296,8 @@ impl JpuDecoder {
 
         let (stream_in_flight, frame_in_flight) = self.begin_dma()?;
         if let Err(error) = gram_setup(self.mmio.jpu_base, stream_dma, &header) {
-            self.quarantine_after_incomplete_dma(stream_in_flight, frame_in_flight);
-            return Err(error.into());
+            let error = JpuDecodeError::from(error);
+            return Err(self.recover_after_failure(stream_in_flight, frame_in_flight, error));
         }
         start_decode(self.mmio.jpu_base, frame_planes, &header, &layout);
 
@@ -268,9 +305,14 @@ impl JpuDecoder {
             PollDisposition::Complete => {
                 self.complete_dma(stream_in_flight, frame_in_flight);
             }
-            PollDisposition::Quarantine(error) => {
-                self.quarantine_after_incomplete_dma(stream_in_flight, frame_in_flight);
-                return Err(error.into());
+            PollDisposition::Recover(error) => {
+                log::warn!(
+                    "[JPU] decode failure after jpeg_len={} (recent oldest..newest: {:?})",
+                    jpeg_data.len(),
+                    self.jpeg_len_history.entries()
+                );
+                let error = JpuDecodeError::from(error);
+                return Err(self.recover_after_failure(stream_in_flight, frame_in_flight, error));
             }
         }
 
@@ -451,10 +493,51 @@ impl JpuDecoder {
         self.frame_buffer = Some(frame);
     }
 
-    fn quarantine_after_incomplete_dma(&mut self, stream: InFlightDma, frame: InFlightDma) {
-        self.poisoned = true;
-        let _stream = stream.quarantine();
-        let _frame = frame.quarantine();
+    /// Resets the JPU after a terminal decode failure and takes both DMA
+    /// buffers back once the reset proves the engines are idle.
+    ///
+    /// `START_INIT` restarts the JPEG block, which stops the stream and frame
+    /// DMA engines; the reset completion plus the BBC idle poll therefore prove
+    /// quiescence before the buffers become CPU-owned again. When the reset or
+    /// the idle poll fails, quiescence is unknown: both buffers are quarantined
+    /// and the decoder stays poisoned. The original error is returned either
+    /// way so callers report the frame that actually failed.
+    fn recover_after_failure(
+        &mut self,
+        stream: InFlightDma,
+        frame: InFlightDma,
+        error: JpuDecodeError,
+    ) -> JpuDecodeError {
+        let jpu_base = self.mmio.jpu_base;
+        let reset = hardware_init_at(jpu_base, self.mmio.top_base, self.mmio.vc_base)
+            .and_then(|()| wait_bbc_idle_at(jpu_base));
+        match reset {
+            Ok(()) => {
+                // SAFETY: the soft reset above restarted the JPEG block and the
+                // BBC reported idle, so no engine can still access these
+                // buffers.
+                let stream = unsafe { stream.complete_after_quiesce() }.into_cpu_buffer();
+                // SAFETY: the same reset covers the output frame DMA engine.
+                let frame = unsafe { frame.complete_after_quiesce() }.into_cpu_buffer();
+                self.stream_buffer = Some(stream);
+                self.frame_buffer = Some(frame);
+                log::warn!(
+                    "[JPU] recovered from decode failure ({error}): JPU reset, DMA buffers \
+                     reclaimed"
+                );
+                error
+            }
+            Err(reset_error) => {
+                self.poisoned = true;
+                let _stream = stream.quarantine();
+                let _frame = frame.quarantine();
+                log::warn!(
+                    "[JPU] cannot reset after decode failure ({error}): {reset_error}; decoder \
+                     poisoned"
+                );
+                error
+            }
+        }
     }
 
     fn clear_frame_padding(&mut self, layout: &FrameLayout) -> Result<(), JpuDecodeError> {
@@ -496,6 +579,22 @@ const fn buffer_plan(
     }
 }
 
+/// End of the stream window declared to the BBC, always one page past the data.
+///
+/// The bitstream buffer fetches whole 256-byte pages and reports the page count
+/// together with `END_FLAG`. A stream whose length is an exact multiple of the
+/// page size would end on that boundary with no page left for the parser's
+/// final lookahead; the hardware then never reports DONE or ERROR (`status=0x4`)
+/// and only the poll timeout ends the decode. Declaring the next page boundary
+/// keeps one zero-filled page available, and the parser still stops at the JPEG
+/// EOI marker inside it.
+fn declared_stream_end(jpeg_len: usize) -> Result<usize, JpegHeaderError> {
+    (jpeg_len / BBC_STREAM_PAGE_SIZE)
+        .checked_add(1)
+        .and_then(|pages| pages.checked_mul(BBC_STREAM_PAGE_SIZE))
+        .ok_or(JpegHeaderError::GramPrefetchRangeOverflow)
+}
+
 fn required_stream_capacity(jpeg_len: usize, ecs_offset: usize) -> Result<usize, JpegHeaderError> {
     if ecs_offset >= jpeg_len {
         return Err(JpegHeaderError::EntropyDataOutsideStream);
@@ -505,7 +604,12 @@ fn required_stream_capacity(jpeg_len: usize, ecs_offset: usize) -> Result<usize,
     let prefetch_end = prefetch_start
         .checked_add(prefetch_len)
         .ok_or(JpegHeaderError::GramPrefetchRangeOverflow)?;
-    Ok(jpeg_len.max(prefetch_end))
+    // One guard page past the declared end keeps `bbc_wr_ptr` strictly inside
+    // the buffer instead of on `bbc_end_addr`.
+    declared_stream_end(jpeg_len)?
+        .max(prefetch_end)
+        .checked_add(BBC_STREAM_PAGE_SIZE)
+        .ok_or(JpegHeaderError::GramPrefetchRangeOverflow)
 }
 
 fn validate_dma_allocation_len(len: usize) -> Result<(), JpuDmaAddressError> {
@@ -698,8 +802,8 @@ mod tests {
 
     use super::{
         BufferPlan, JpegHeaderError, JpuInspectError, PollDisposition, buffer_plan,
-        clear_frame_padding, copy_frame_range, inspect_jpeg_layout, poll_disposition,
-        required_stream_capacity, validate_dma_allocation_len,
+        clear_frame_padding, copy_frame_range, declared_stream_end, inspect_jpeg_layout,
+        poll_disposition, required_stream_capacity, validate_dma_allocation_len,
     };
     use crate::{FrameLayout, JpuPixelFormat, JpuScale, engine::PollError};
 
@@ -813,12 +917,21 @@ mod tests {
 
     #[test]
     fn stream_capacity_covers_two_page_gram_prefetch() {
-        assert_eq!(required_stream_capacity(1000, 500), Ok(1000));
-        assert_eq!(required_stream_capacity(1000, 900), Ok(1280));
-        assert_eq!(required_stream_capacity(16_384, 16_383), Ok(16_640));
+        assert_eq!(required_stream_capacity(1000, 500), Ok(1280));
+        assert_eq!(required_stream_capacity(1000, 900), Ok(1536));
+        assert_eq!(required_stream_capacity(16_384, 16_383), Ok(16_896));
         assert!(required_stream_capacity(1000, 1000).is_err());
         assert!(required_stream_capacity(1000, 1001).is_err());
         assert!(required_stream_capacity(usize::MAX, usize::MAX - 1).is_err());
+    }
+
+    #[test]
+    fn page_aligned_streams_declare_one_extra_zero_page() {
+        // 39_936 bytes is exactly 156 pages; the declared window must still
+        // cover page 157 so the parser lookahead never runs dry.
+        assert_eq!(declared_stream_end(39_936), Ok(40_192));
+        assert_eq!(declared_stream_end(39_952), Ok(40_192));
+        assert_eq!(required_stream_capacity(39_936, 0), Ok(40_448));
     }
 
     #[test]
@@ -894,11 +1007,29 @@ mod tests {
     }
 
     #[test]
-    fn decode_error_requires_dma_quarantine() {
+    fn decode_error_requests_hardware_recovery() {
         assert_eq!(
             poll_disposition(Err(PollError::Decode)),
-            PollDisposition::Quarantine(PollError::Decode)
+            PollDisposition::Recover(PollError::Decode)
         );
+    }
+
+    #[test]
+    fn decode_timeout_requests_hardware_recovery() {
+        assert_eq!(
+            poll_disposition(Err(PollError::Timeout)),
+            PollDisposition::Recover(PollError::Timeout)
+        );
+    }
+
+    #[test]
+    fn jpeg_len_history_keeps_the_newest_entries_in_order() {
+        let mut history = super::JpegLenHistory::default();
+        for len in [11u32, 22, 33, 44, 55, 66] {
+            history.record(len as usize);
+        }
+
+        assert_eq!(history.entries(), [33, 44, 55, 66].as_slice());
     }
 
     #[test]

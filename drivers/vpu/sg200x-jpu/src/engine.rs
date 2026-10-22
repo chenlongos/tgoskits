@@ -370,7 +370,10 @@ pub(super) fn start_decode(
 
 pub(super) fn poll_decode_done(jpu_base: usize) -> Result<(), PollError> {
     let mut count = 0u32;
-    const MAX_POLLS: u32 = 500_000;
+    // ~0.5 s on hardware (500_000 polls measured ~5.2 s): a stalled frame is now
+    // repaired by a hardware reset in the decoder, so a longer wait only delays
+    // the caller without improving the outcome.
+    const MAX_POLLS: u32 = 50_000;
     let r = jpu_regs_at(jpu_base);
 
     loop {

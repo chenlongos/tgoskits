@@ -341,12 +341,10 @@ pub enum JpuDecodeError {
     #[error("JPU hardware setup failed: {0}")]
     HardwareSetup(#[from] JpuHardwareSetupError),
     /// The JPU reported an error before DMA quiescence could be proven.
-    #[error(
-        "SG200x JPU reported a decode error before DMA quiescence was proven; reboot is required"
-    )]
+    #[error("SG200x JPU reported a decode error")]
     DecodeFailed,
     /// The JPU did not reach a terminal state before the poll limit.
-    #[error("SG200x JPU decode timed out; reboot is required")]
+    #[error("SG200x JPU decode timed out")]
     Timeout,
 }
 
