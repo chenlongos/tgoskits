@@ -192,9 +192,16 @@ impl UsbCameraState {
         }
         self.platform_init_once()?;
 
-        // 帧选择偏好：640×480（JPU pool 上限）+ 倾向 30fps。
+        // 帧选择偏好：只设像素数上限（同时也是 JPU 1 MiB DMA pool 的硬解码上限），
+        // 让驱动自动挑 "≤ 上限里面积最大" 的那档，而不是钉死精确尺寸：
+        //   - 相机 A(0c45:64ab) 有 640×480（正好等于上限）→ 仍命中 640×480，行为不变。
+        //   - 相机 B(b349:b182) 无 640×480。若用 set_preferred_frame_size(640,480) 钉死
+        //     精确尺寸，rank() 在命不中精确尺寸时会退化成 `pref_area - area`（面积越小
+        //     分越高），把 B 推到最小的 320×240；改走 max-pixels 分支后，B 落在 ≤640×480
+        //     里最大的 640×360，仍在 JPU pool 内，也更接近 akars 期望的几何。
+        // 精确尺寸偏好仅在相机确有该档时才安全，故这里显式关闭 (0, 0)。
         uvc::set_preferred_max_pixels(DEFAULT_RESOLUTION);
-        uvc::set_preferred_frame_size(640, 480);
+        uvc::set_preferred_frame_size(0, 0);
         uvc::set_preferred_frame_interval(333_333);
 
         let tune = uvc::UvcImageTuning {
@@ -203,11 +210,15 @@ impl UsbCameraState {
         };
         match UvcSession::open(&tune) {
             Ok(s) => {
+                let sel = s.selection();
                 info!(
-                    "cvi-camera: UVC session ready addr={} {}x{}",
+                    "cvi-camera: UVC session ready addr={} {}x{} fmt={} iv={} alt={}",
                     s.dev(),
-                    s.selection().frame_w,
-                    s.selection().frame_h
+                    sel.frame_w,
+                    sel.frame_h,
+                    if sel.is_mjpeg { "MJPG" } else { "YUYV" },
+                    sel.frame_interval,
+                    sel.alt_setting,
                 );
                 self.session = Some(s);
                 Ok(())
@@ -234,7 +245,7 @@ impl UsbCameraState {
     ///
     /// `UvcSession::capture_recovering` 内部按 sdmmc 风格重试（中止通道 + 重协商）；
     /// 返回 `Disconnected`/`NeedsReenum` 时拆除会话并重新 `open` 再试一次（即热插回）。
-    /// 仍失败则返回 `Io`（摄像头可能已拔出，userspace 下次 ioctl 会再次尝试重建）。
+    /// 恢复耗尽时返回 `AxError::Io`。
     fn frame(&mut self) -> VfsResult<&'static [u8]> {
         for attempt in 0..2u32 {
             self.ensure_initialized()?;
@@ -253,22 +264,19 @@ impl UsbCameraState {
                             "cvi-camera: invalid frame size={n} (attempt {}); retry",
                             attempt + 1
                         );
-                        // 瞬时错误：丢弃本帧重试。capture_recovering 自带 FID/EOF 连续性
-                        // 处理，这里直接进入下一轮循环。
                         continue;
                     }
                     return Ok(jpeg);
                 }
                 Err(e) => {
                     warn!(
-                        "cvi-camera: capture_recovering failed (attempt {}): {:?}; teardown + re-init",
-                        attempt + 1,
-                        e
+                        "cvi-camera: capture_recovering failed (attempt {}): {e:?}; teardown + \
+                         re-init",
+                        attempt + 1
                     );
                     if let Some(mut s) = self.session.take() {
                         s.teardown();
                     }
-                    // 循环回到 ensure_initialized 重新 open（热插回路径）。
                 }
             }
         }
@@ -295,10 +303,18 @@ impl UsbCameraState {
     fn yuv_frame(&mut self) -> VfsResult<&'static [u8]> {
         let jpeg = self.frame()?;
         let jpu = self.ensure_jpu()?;
-        let result = jpu.decode(jpeg).map_err(|e| {
-            warn!("cvi-camera: JPU decode failed: {e}");
-            AxError::Io
-        })?;
+        let result = match jpu.decode(jpeg) {
+            Ok(r) => r,
+            Err(e) => {
+                // 解卡：sg200x-bsp 的 `start_decode` 在 `START_PIC` 前不做 `START_INIT` 软
+                // 复位，一旦某帧（典型为长度是 256 整数倍、BBC 页边界缺前瞻）把引擎挂死，
+                // 之后每帧都会超时。丢弃 decoder，下一帧 `ensure_jpu` 重新 `new_at` 会走
+                // `hardware_init_at -> wait_sw_reset_done`（START_INIT）复位并回收 buffer。
+                warn!("cvi-camera: JPU decode failed: {e}; reset JPU");
+                self.jpu = None;
+                return Err(AxError::Io);
+            }
+        };
         info!(
             "cvi-camera: JPU decode OK {}x{} yuv={} bytes",
             result.width,
